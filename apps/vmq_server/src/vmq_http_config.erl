@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ config([HttpModule|Rest], Routes) when is_atom(HttpModule) ->
         config(Rest, Routes ++ ModRoutes)
     catch
         E:R ->
-            lager:error("can't call ~p:routes() due to ~p ~p", [E, R]),
+            lager:error("can't call ~p:routes() due to ~p ~p", [HttpModule, E, R]),
             config(Rest, Routes)
     end;
 config([], Routes) ->

@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,13 +18,13 @@
 %% API
 -export([
          %% used in mqtt fsm handling
-         subscribe/4,
-         unsubscribe/4,
-         register_subscriber/3,
-         register_subscriber/4, %% used during testing
+         subscribe/3,
+         unsubscribe/3,
+         register_subscriber/4,
+         register_subscriber/5, %% used during testing
          delete_subscriptions/1,
          %% used in mqtt fsm handling
-         publish/3,
+         publish/4,
 
          %% used in :get_info/2
          get_session_pids/1,
@@ -41,82 +41,72 @@
         ]).
 
 %% called by vmq_cluster_com
--export([publish/2]).
+-export([publish/3]).
 
 %% used from plugins
 -export([direct_plugin_exports/1]).
 %% used by reg views
 -export([subscribe_subscriber_changes/0,
          fold_subscriptions/2,
-         fold_subscribers/2,
-         fold_subscribers/3]).
+         fold_subscribers/2]).
 
-%% exported because currently used by netsplit tests
+%% exported because currently used by queue & netsplit tests
 -export([subscriptions_for_subscriber_id/1]).
+
+%% exported for testing purposes
+-export([retain_pre/1]).
 
 -define(NR_OF_REG_RETRIES, 10).
 
--spec subscribe(flag(), username() | plugin_id(), subscriber_id(),
-                [{topic(), qos()}]) -> {ok, [qos() | not_allowed]}
-                                       | {error, not_allowed | not_ready}.
 
-subscribe(false, User, SubscriberId, Topics) ->
+-spec subscribe(flag(), subscriber_id(),
+                [subscription()]) -> {ok, [qos() | not_allowed]} |
+                                     {error, not_allowed | not_ready}.
+subscribe(false, SubscriberId, Topics) ->
     %% trade availability for consistency
-    vmq_cluster:if_ready(fun subscribe_/3, [User, SubscriberId, Topics]);
-subscribe(true, User, SubscriberId, Topics) ->
+    vmq_cluster:if_ready(fun subscribe_op/2, [SubscriberId, Topics]);
+subscribe(true, SubscriberId, Topics) ->
     %% trade consistency for availability
-    subscribe_(User, SubscriberId, Topics).
+    subscribe_op(SubscriberId, Topics).
 
-subscribe_(User, SubscriberId, Topics) ->
-    case vmq_plugin:all_till_ok(auth_on_subscribe,
-                                [User, SubscriberId, Topics]) of
-        ok ->
-            subscribe_op(User, SubscriberId, Topics);
-        {ok, NewTopics} when is_list(NewTopics) ->
-            subscribe_op(User, SubscriberId, NewTopics);
-        {error, _} ->
-            {error, not_allowed}
-    end.
-
-subscribe_op(User, SubscriberId, Topics) ->
-    add_subscriber(lists:usort(Topics), SubscriberId),
+subscribe_op(SubscriberId, Topics) ->
+    OldSubs = subscriptions_for_subscriber_id(SubscriberId),
+    Existing = subscriptions_exist(OldSubs, Topics),
+    add_subscriber(lists:usort(Topics), OldSubs, SubscriberId),
     QoSTable =
-    lists:foldl(fun ({_, not_allowed}, AccQoSTable) ->
+    lists:foldl(fun
+                    %% MQTTv4 clauses
+                    ({_, {_, not_allowed}}, AccQoSTable) ->
                         [not_allowed|AccQoSTable];
-                    ({T, QoS}, AccQoSTable) when is_integer(QoS) ->
-                        deliver_retained(SubscriberId, T, QoS),
+                    ({Exists, {T, QoS}}, AccQoSTable) when is_integer(QoS) ->
+                        deliver_retained(SubscriberId, T, QoS, #{}, Exists),
+                        [QoS|AccQoSTable];
+                    %% MQTTv5 clauses
+                    ({_, {_, {not_allowed, _}}}, AccQoSTable) ->
+                        [not_allowed|AccQoSTable];
+                    ({Exists, {T, {QoS, SubOpts}}}, AccQoSTable) when is_integer(QoS), is_map(SubOpts) ->
+                        deliver_retained(SubscriberId, T, QoS, SubOpts, Exists),
                         [QoS|AccQoSTable]
-                end, [], Topics),
-    vmq_plugin:all(on_subscribe, [User, SubscriberId, Topics]),
+                end, [], lists:zip(Existing,Topics)),
     {ok, lists:reverse(QoSTable)}.
 
--spec unsubscribe(flag(), username() | plugin_id(),
-                  subscriber_id(), [topic()]) -> ok | {error, not_ready}.
-unsubscribe(false, User, SubscriberId, Topics) ->
+-spec unsubscribe(flag(), subscriber_id(), [topic()]) -> ok | {error, not_ready}.
+unsubscribe(false, SubscriberId, Topics) ->
     %% trade availability for consistency
-    vmq_cluster:if_ready(fun unsubscribe_op/3, [User, SubscriberId, Topics]);
-unsubscribe(true, User, SubscriberId, Topics) ->
+    vmq_cluster:if_ready(fun unsubscribe_op/2, [SubscriberId, Topics]);
+unsubscribe(true, SubscriberId, Topics) ->
     %% trade consistency for availability
-    unsubscribe_op(User, SubscriberId, Topics).
+    unsubscribe_op( SubscriberId, Topics).
 
-unsubscribe_op(User, SubscriberId, Topics) ->
-    TTopics =
-    case vmq_plugin:all_till_ok(on_unsubscribe, [User, SubscriberId, Topics]) of
-        ok ->
-            Topics;
-        {ok, [[W|_]|_] = NewTopics} when is_binary(W) ->
-            NewTopics;
-        {error, _} ->
-            Topics
-    end,
-    del_subscriptions(TTopics, SubscriberId).
+unsubscribe_op(SubscriberId, Topics) ->
+    del_subscriptions(Topics, SubscriberId).
 
 delete_subscriptions(SubscriberId) ->
     del_subscriber(SubscriberId).
 
--spec register_subscriber(flag(), subscriber_id(), map()) ->
+-spec register_subscriber(flag(), subscriber_id(), boolean(), map()) ->
     {ok, boolean(), pid()} | {error, _}.
-register_subscriber(CAPAllowRegister, SubscriberId, #{allow_multiple_sessions := false} = QueueOpts) ->
+register_subscriber(CAPAllowRegister, SubscriberId, StartClean, #{allow_multiple_sessions := false} = QueueOpts) ->
     %% we don't allow multiple sessions using same subscriber id
     %% allow_multiple_sessions is needed for session balancing
     SessionPid = self(),
@@ -124,20 +114,20 @@ register_subscriber(CAPAllowRegister, SubscriberId, #{allow_multiple_sessions :=
         true ->
             vmq_reg_sync:sync(SubscriberId,
                               fun() ->
-                                      register_subscriber(SessionPid, SubscriberId,
+                                      register_subscriber(SessionPid, SubscriberId, StartClean,
                                                           QueueOpts, ?NR_OF_REG_RETRIES)
                               end, 60000);
         false when CAPAllowRegister ->
             %% synchronize action on this node
             vmq_reg_sync:sync(SubscriberId,
                               fun() ->
-                                      register_subscriber(SessionPid, SubscriberId,
+                                      register_subscriber(SessionPid, SubscriberId, StartClean,
                                                           QueueOpts, ?NR_OF_REG_RETRIES)
                               end, node(), 60000);
         false ->
             {error, not_ready}
     end;
-register_subscriber(CAPAllowRegister, SubscriberId, #{allow_multiple_sessions := true} = QueueOpts) ->
+register_subscriber(CAPAllowRegister, SubscriberId, _StartClean, #{allow_multiple_sessions := true} = QueueOpts) ->
     %% we allow multiple sessions using same subscriber id
     %%
     %% !!! CleanSession is disabled if multiple sessions are in use
@@ -149,18 +139,17 @@ register_subscriber(CAPAllowRegister, SubscriberId, #{allow_multiple_sessions :=
             {error, not_ready}
     end.
 
--spec register_subscriber(pid() | undefined, subscriber_id(), map(), non_neg_integer()) ->
+-spec register_subscriber(pid() | undefined, subscriber_id(), boolean(), map(), non_neg_integer()) ->
     {'ok', boolean(), pid()} | {error, any()}.
-register_subscriber(_, _, _, 0) ->
+register_subscriber(_, _, _, _, 0) ->
     {error, register_subscriber_retry_exhausted};
-register_subscriber(SessionPid, SubscriberId,
-                    #{clean_session := CleanSession} = QueueOpts, N) ->
+register_subscriber(SessionPid, SubscriberId, StartClean, QueueOpts, N) ->
     % wont create new queue in case it already exists
     {ok, QueuePresent, QPid} =
     case vmq_queue_sup_sup:start_queue(SubscriberId) of
-        {ok, true, OldQPid} when CleanSession ->
+        {ok, true, OldQPid} when StartClean ->
             %% cleanup queue
-            vmq_queue:cleanup(OldQPid),
+            vmq_queue:cleanup(OldQPid, ?SESSION_TAKEN_OVER),
             vmq_queue_sup_sup:start_queue(SubscriberId);
         Ret -> Ret
     end,
@@ -168,12 +157,12 @@ register_subscriber(SessionPid, SubscriberId,
     % reach the new queue.
     % Remapping triggers remote nodes to initiate queue migration
     {SubscriptionsPresent, UpdatedSubs, ChangedNodes}
-    = maybe_remap_subscriber(SubscriberId, QueueOpts),
+    = maybe_remap_subscriber(SubscriberId, StartClean),
     SessionPresent1 = SubscriptionsPresent or QueuePresent,
     SessionPresent2 =
-    case CleanSession of
+    case StartClean of
         true ->
-            false; %% SessionPresent is always false in case CleanSession=true
+            false; %% SessionPresent is always false in case CleanupSession=true
         false when QueuePresent ->
             %% no migration expected to happen, as queue is already local.
             SessionPresent1;
@@ -197,11 +186,11 @@ register_subscriber(SessionPid, SubscriberId,
     case catch vmq_queue:add_session(QPid, SessionPid, QueueOpts) of
         {'EXIT', {normal, _}} ->
             %% queue went down in the meantime, retry
-            register_subscriber(SessionPid, SubscriberId, QueueOpts, N -1);
+            register_subscriber(SessionPid, SubscriberId, StartClean, QueueOpts, N -1);
         {'EXIT', {noproc, _}} ->
             timer:sleep(100),
             %% queue was stopped in the meantime, retry
-            register_subscriber(SessionPid, SubscriberId, QueueOpts, N -1);
+            register_subscriber(SessionPid, SubscriberId, StartClean, QueueOpts, N -1);
         {'EXIT', Reason} ->
             {error, Reason};
         {error, draining} ->
@@ -209,11 +198,11 @@ register_subscriber(SessionPid, SubscriberId,
             %% remote queue. This can happen if a client hops around
             %% different nodes very frequently... adjust load balancing!!
             timer:sleep(100),
-            register_subscriber(SessionPid, SubscriberId, QueueOpts, N -1);
-        {error, cleanup} ->
+            register_subscriber(SessionPid, SubscriberId, StartClean, QueueOpts, N -1);
+        {error, {cleanup, _Reason}} ->
             %% queue is still cleaning up.
             timer:sleep(100),
-            register_subscriber(SessionPid, SubscriberId, QueueOpts, N -1);
+            register_subscriber(SessionPid, SubscriberId, StartClean, QueueOpts, N -1);
         ok ->
             {ok, SessionPresent2, QPid}
     end.
@@ -265,18 +254,20 @@ register_session(SubscriberId, QueueOpts) ->
     SessionPresent = QueuePresent,
     {ok, SessionPresent, QPid}.
 
-publish(RegView, MP, Topic, FoldFun, #vmq_msg{sg_policy = SGPolicy} = Msg) ->
+publish(RegView, ClientId, Topic, FoldFun, #vmq_msg{sg_policy = SGPolicy,
+                                                    mountpoint = MP} = Msg) ->
     Acc = publish_fold_acc(Msg),
-    {NewMsg, SubscriberGroups} = vmq_reg_view:fold(RegView, MP, Topic, FoldFun, Acc),
+    {NewMsg, SubscriberGroups} = vmq_reg_view:fold(RegView, {MP, ClientId}, Topic, FoldFun, Acc),
     vmq_shared_subscriptions:publish(NewMsg, SGPolicy, SubscriberGroups).
 
 publish_fold_acc(Msg) -> {Msg, undefined}.
 
--spec publish(flag(), module(), msg()) -> 'ok' | {'error', _}.
-publish(true, RegView, #vmq_msg{mountpoint=MP,
-                                routing_key=Topic,
-                                payload=Payload,
-                                retain=IsRetain} = Msg) ->
+-spec publish(flag(), module(), client_id() | ?INTERNAL_CLIENT_ID, msg()) -> 'ok' | {'error', _}.
+publish(true, RegView, ClientId, #vmq_msg{mountpoint=MP,
+                                          routing_key=Topic,
+                                          payload=Payload,
+                                          retain=IsRetain,
+                                          properties=Properties} = Msg) ->
     %% trade consistency for availability
     %% if the cluster is not consistent at the moment, it is possible
     %% that subscribers connected to other nodes won't get this message
@@ -284,53 +275,75 @@ publish(true, RegView, #vmq_msg{mountpoint=MP,
         true when Payload == <<>> ->
             %% retain delete action
             vmq_retain_srv:delete(MP, Topic),
-
-            publish(RegView, MP, Topic, fun publish/2, Msg#vmq_msg{retain=false}),
+            publish(RegView, ClientId, Topic, fun publish/3, Msg),
             ok;
         true ->
             %% retain set action
-            vmq_retain_srv:insert(MP, Topic, Payload),
-            publish(RegView, MP, Topic, fun publish/2, Msg#vmq_msg{retain=false}),
+            vmq_retain_srv:insert(MP, Topic, #retain_msg{
+                                                payload = Payload,
+                                                properties = Properties,
+                                                expiry_ts = maybe_set_expiry_ts(Properties)
+                                               }),
+            publish(RegView, ClientId, Topic, fun publish/3, Msg),
             ok;
         false ->
-            publish(RegView, MP, Topic, fun publish/2, Msg),
+            publish(RegView, ClientId, Topic, fun publish/3, Msg),
             ok
     end;
-publish(false, RegView, #vmq_msg{mountpoint=MP,
-                                 routing_key=Topic,
-                                 payload=Payload,
-                                 retain=IsRetain} = Msg) ->
+publish(false, RegView, ClientId, #vmq_msg{mountpoint=MP,
+                                               routing_key=Topic,
+                                               payload=Payload,
+                                               properties=Properties,
+                                               retain=IsRetain} = Msg) ->
     %% don't trade consistency for availability
     case vmq_cluster:is_ready() of
         true when (IsRetain == true) and (Payload == <<>>) ->
             %% retain delete action
             vmq_retain_srv:delete(MP, Topic),
-            publish(RegView, MP, Topic, fun publish/2, Msg#vmq_msg{retain=false}),
+            publish(RegView, ClientId, Topic, fun publish/3, Msg),
             ok;
         true when (IsRetain == true) ->
             %% retain set action
-            vmq_retain_srv:insert(MP, Topic, Payload),
-            publish(RegView, MP, Topic, fun publish/2, Msg#vmq_msg{retain=false}),
+            vmq_retain_srv:insert(MP, Topic, #retain_msg{
+                                                payload = Payload,
+                                                properties = Properties,
+                                                expiry_ts = maybe_set_expiry_ts(Properties)
+                                               }),
+            publish(RegView, ClientId, Topic, fun publish/3, Msg),
             ok;
         true ->
-            publish(RegView, MP, Topic, fun publish/2, Msg),
+            publish(RegView, ClientId, Topic, fun publish/3, Msg),
             ok;
         false ->
             {error, not_ready}
     end.
 
-%% publish/2 is used as the fold function in RegView:fold/4
-publish({{_,_} = SubscriberId, QoS}, {Msg, _} = Acc) ->
+maybe_set_expiry_ts(#{p_message_expiry_interval := ExpireAfter}) ->
+    {vmq_time:timestamp(second) + ExpireAfter, ExpireAfter};
+maybe_set_expiry_ts(_) ->
+    undefined.
+
+%% publish/3 is used as the fold function in RegView:fold/4
+publish({SubscriberId, {_, #{no_local := true}}}, SubscriberId, Acc) ->
+    %% Publisher is the same as subscriber, discard.
+    Acc;
+publish({{_,_} = SubscriberId, SubInfo}, _FromClientId, {Msg0, _} = Acc) ->
     case get_queue_pid(SubscriberId) of
         not_found -> Acc;
         QPid ->
-            ok = vmq_queue:enqueue(QPid, {deliver, QoS, Msg}),
+            Msg1 = handle_rap_flag(SubInfo, Msg0),
+            Msg2 = maybe_add_sub_id(SubInfo, Msg1),
+            QoS = qos(SubInfo),
+            ok = vmq_queue:enqueue(QPid, {deliver, QoS, Msg2}),
             Acc
     end;
-publish({_Node, _Group, _SubscriberId, _QoS} = Sub, {Msg, SubscriberGroups}) ->
+publish({_Node, _Group, SubscriberId, #{no_local := true}}, SubscriberId, Acc) ->
+    %% Publisher is the same as subscriber, discard.
+    Acc;
+publish({_Node, _Group, _SubscriberId, _SubInfo} = Sub, _FromClientId, {Msg, SubscriberGroups}) ->
     %% collect subscriber group members for later processing
     {Msg, add_to_subscriber_group(Sub, SubscriberGroups)};
-publish(Node, {Msg, _} = Acc) ->
+publish(Node, _FromClientId, {Msg, _} = Acc) ->
     case vmq_cluster:publish(Node, Msg) of
         ok ->
             Acc;
@@ -339,30 +352,79 @@ publish(Node, {Msg, _} = Acc) ->
             Acc
     end.
 
+-spec handle_rap_flag(subinfo(), msg()) -> msg().
+handle_rap_flag({_QoS, #{rap := true}}, Msg) ->
+    Msg;
+handle_rap_flag(_SubInfo, Msg) ->
+    %% Default is to set the retain flag to false to be compatible with MQTTv3
+    Msg#vmq_msg{retain = false}.
+
+maybe_add_sub_id({_, #{sub_id := SubId}}, #vmq_msg{properties = Props} = Msg) ->
+    Msg#vmq_msg{properties = Props#{p_subscription_id => [SubId]}};
+maybe_add_sub_id(_, Msg) ->
+    Msg.
+
+-spec qos(subinfo()) -> qos().
+qos({QoS, _}) when is_integer(QoS) ->
+    QoS;
+qos(QoS) when is_integer(QoS) ->
+    QoS.
+
 add_to_subscriber_group(Sub, undefined) ->
     add_to_subscriber_group(Sub, #{});
-add_to_subscriber_group({Node, Group, SubscriberId, QoS}, SubscriberGroups) ->
+add_to_subscriber_group({Node, Group, SubscriberId, SubInfo}, SubscriberGroups) ->
     SubscriberGroup = maps:get(Group, SubscriberGroups, []),
-    maps:put(Group, [{Node, SubscriberId, QoS}|SubscriberGroup],
+    maps:put(Group, [{Node, SubscriberId, SubInfo}|SubscriberGroup],
              SubscriberGroups).
 
--spec deliver_retained(subscriber_id(), topic(), qos()) -> 'ok'.
-deliver_retained(_SubscriberId, [<<"$share">>|_], _QoS) ->
+-spec deliver_retained(subscriber_id(), topic(), qos(), subopts(), boolean()) -> 'ok'.
+deliver_retained(_, _, _, #{retain_handling := dont_send}, _) ->
+    %% don't send, skip
+    ok;
+deliver_retained(_, _, _, #{retain_handling := send_if_new_sub}, true) ->
+    %% subscription already existed, skip.
+    ok;
+deliver_retained(_SubscriberId, [<<"$share">>|_], _QoS, _SubOpts, _) ->
     %% Never deliver retained messages to subscriber groups.
     ok;
-deliver_retained({MP, _} = SubscriberId, Topic, QoS) ->
+deliver_retained({MP, _} = SubscriberId, Topic, QoS, _SubOpts, _) ->
     QPid = get_queue_pid(SubscriberId),
     vmq_retain_srv:match_fold(
-      fun ({T, Payload}, _) ->
+      fun ({T, #retain_msg{payload = Payload,
+                           properties = Properties,
+                           expiry_ts = ExpiryTs}}, _) ->
               Msg = #vmq_msg{routing_key=T,
-                             payload=Payload,
+                             payload=retain_pre(Payload),
                              retain=true,
                              qos=QoS,
                              dup=false,
                              mountpoint=MP,
-                             msg_ref=vmq_mqtt_fsm:msg_ref()},
+                             msg_ref=vmq_mqtt_fsm_util:msg_ref(),
+                             expiry_ts = ExpiryTs,
+                             properties=Properties},
+              maybe_delete_expired(ExpiryTs, MP, Topic),
+              vmq_queue:enqueue(QPid, {deliver, QoS, Msg});
+          ({T, Payload}, _) when is_binary(Payload) ->
+              %% compatibility with old style retained messages.
+              Msg = #vmq_msg{routing_key=T,
+                             payload=retain_pre(Payload),
+                             retain=true,
+                             qos=QoS,
+                             dup=false,
+                             mountpoint=MP,
+                             msg_ref=vmq_mqtt_fsm_util:msg_ref(),
+                             properties=#{}},
               vmq_queue:enqueue(QPid, {deliver, QoS, Msg})
       end, ok, MP, Topic).
+
+maybe_delete_expired(undefined, _, _) -> ok;
+maybe_delete_expired({Ts, _}, MP, Topic) ->
+    case vmq_time:is_past(Ts) of
+        true ->
+            vmq_retain_srv:delete(MP, Topic);
+        _ ->
+            ok
+    end.
 
 subscriptions_for_subscriber_id(SubscriberId) ->
     Default = [],
@@ -418,7 +480,7 @@ fix_dead_queues(_, []) -> exit(no_target_available);
 fix_dead_queues(DeadNodes, AccTargets) ->
     %% DeadNodes must be a list of offline VerneMQ nodes
     %% Targets must be a list of online VerneMQ nodes
-    {_, _, N} = fold_subscribers(fun fix_dead_queue/3, {DeadNodes, AccTargets, 0}, false),
+    {_, _, N} = fold_subscribers(fun fix_dead_queue/3, {DeadNodes, AccTargets, 0}),
     lager:info("dead queues summary: ~p queues fixed", [N]).
 
 fix_dead_queue(SubscriberId, Subs, {DeadNodes, [Target|Targets], N}) ->
@@ -497,12 +559,12 @@ direct_plugin_exports(Mod) when is_atom(Mod) ->
             PluginSessionPid = spawn_link(
                                  fun() ->
                                          monitor(process, PluginPid),
-                                         plugin_queue_loop(PluginPid, Mod)
+                                         vmq_mqtt_fsm_util:plugin_receive_loop(PluginPid, Mod)
                                  end),
             QueueOpts = maps:merge(vmq_queue:default_opts(),
-                                   #{clean_session => true,
+                                   #{cleanup_on_disconnect => true,
                                      is_plugin => true}),
-            {ok, _, _} = register_subscriber(PluginSessionPid, SubscriberId,
+            {ok, _, _} = register_subscriber(PluginSessionPid, SubscriberId, true,
                                              QueueOpts, ?NR_OF_REG_RETRIES),
             ok
     end,
@@ -523,13 +585,13 @@ direct_plugin_exports(Mod) when is_atom(Mod) ->
                      routing_key=Topic,
                      mountpoint=maps:get(mountpoint, Opts, MountPoint),
                      payload=Payload,
-                     msg_ref=vmq_mqtt_fsm:msg_ref(),
+                     msg_ref=vmq_mqtt_fsm_util:msg_ref(),
                      qos = maps:get(qos, Opts, 0),
                      dup=maps:get(dup, Opts, false),
                      retain=maps:get(retain, Opts, false),
                      sg_policy=maps:get(shared_subscription_policy, Opts, SGPolicyConfig)
                     },
-            publish(CAPPublish, RegView, Msg)
+            publish(CAPPublish, RegView, ClientId(CallingPid), Msg)
     end,
 
     SubscribeFun =
@@ -537,8 +599,7 @@ direct_plugin_exports(Mod) when is_atom(Mod) ->
             wait_til_ready(),
             CallingPid = self(),
             User = {plugin, Mod, CallingPid},
-            subscribe(CAPSubscribe, User,
-                      {MountPoint, ClientId(CallingPid)}, [{Topic, 0}]);
+            subscribe(CAPSubscribe, {MountPoint, ClientId(CallingPid)}, [{Topic, 0}]);
        (_) ->
             {error, invalid_topic}
     end,
@@ -548,86 +609,52 @@ direct_plugin_exports(Mod) when is_atom(Mod) ->
             wait_til_ready(),
             CallingPid = self(),
             User = {plugin, Mod, CallingPid},
-            unsubscribe(CAPUnsubscribe, User,
-                        {MountPoint, ClientId(CallingPid)}, [Topic]);
+            unsubscribe(CAPUnsubscribe, {MountPoint, ClientId(CallingPid)}, [Topic]);
        (_) ->
             {error, invalid_topic}
     end,
     {RegisterFun, PublishFun, {SubscribeFun, UnsubscribeFun}}.
 
-plugin_queue_loop(PluginPid, PluginMod) ->
-    receive
-        {vmq_mqtt_fsm, {mail, QPid, new_data}} ->
-            vmq_queue:active(QPid),
-            plugin_queue_loop(PluginPid, PluginMod);
-        {vmq_mqtt_fsm, {mail, QPid, Msgs, _, _}} ->
-            lists:foreach(fun({deliver, QoS, #vmq_msg{
-                                                routing_key=RoutingKey,
-                                                payload=Payload,
-                                                retain=IsRetain,
-                                                dup=IsDup}}) ->
-                                  PluginPid ! {deliver, RoutingKey,
-                                               Payload,
-                                               QoS,
-                                               IsRetain,
-                                               IsDup};
-                             (Msg) ->
-                                  lager:warning("dropped message ~p for plugin ~p", [Msg, PluginMod]),
-                                  ok
-                          end, Msgs),
-            vmq_queue:notify(QPid),
-            plugin_queue_loop(PluginPid, PluginMod);
-        {info_req, {Ref, CallerPid}, _} ->
-            CallerPid ! {Ref, {error, i_am_a_plugin}},
-            plugin_queue_loop(PluginPid, PluginMod);
-        disconnect ->
-            ok;
-        {'DOWN', _MRef, process, PluginPid, Reason} ->
-            case (Reason == normal) or (Reason == shutdown) of
-                true ->
-                    ok;
-                false ->
-                    lager:warning("plugin queue loop for ~p stopped due to ~p", [PluginMod, Reason])
-            end;
-        Other ->
-            exit({unknown_msg_in_plugin_loop, Other})
-    end.
-
 subscribe_subscriber_changes() ->
     vmq_subscriber_db:subscribe_db_events().
 
 fold_subscriptions(FoldFun, Acc) ->
-    Node = node(),
     fold_subscribers(
       fun ({MP, _} = SubscriberId, Subs, AAcc) ->
               vmq_subscriber:fold(
-                fun({Topic, QoS, N}, AAAcc) when Node == N ->
-                        FoldFun({MP, Topic, {SubscriberId, QoS, undefined}}, AAAcc);
-                   ({Topic, _QoS, N}, AAAcc) ->
-                        FoldFun({MP, Topic, N}, AAAcc)
+                fun({Topic, QoS, Node}, AAAcc) ->
+                        FoldFun({MP, Topic, {SubscriberId, QoS, Node}}, AAAcc)
                 end, AAcc, Subs)
-      end, Acc, false).
+      end, Acc).
 
 fold_subscribers(FoldFun, Acc) ->
-    fold_subscribers(FoldFun, Acc, true).
-
-fold_subscribers(FoldFun, Acc, CompactResult) ->
     vmq_subscriber_db:fold(
-      fun ({SubscriberId, Subs}, AccAcc) when CompactResult ->
-              FoldFun(SubscriberId, vmq_subscriber:get_nodes(Subs), AccAcc);
-          ({SubscriberId, Subs}, AccAcc) ->
+      fun ({SubscriberId, Subs}, AccAcc) ->
               FoldFun(SubscriberId, Subs, AccAcc)
       end, Acc).
 
--spec add_subscriber([{topic(), qos() | not_allowed}], subscriber_id()) -> ok.
-add_subscriber(Topics, SubscriberId) ->
-    OldSubs = subscriptions_for_subscriber_id(SubscriberId),
-    case vmq_subscriber:add(OldSubs, [{T, QoS}||{T, QoS} <- Topics, is_integer(QoS)]) of
-        {NewSubs, true} ->
-            vmq_subscriber_db:store(SubscriberId, NewSubs);
+-spec add_subscriber([{topic(), qos() | not_allowed} |
+                      {topic(), {qos() | not_allowed, map()}}],
+                     vmq_subscriber:subs(), subscriber_id()) -> ok.
+add_subscriber(Topics, OldSubs, SubscriberId) ->
+    NewSubs =
+        lists:filter(
+          fun({_T, QoS}) when is_integer(QoS) ->
+                  true;
+             ({_T, {QoS, _Opts}}) when is_integer(QoS) ->
+                  true;
+             (_) -> false
+          end, Topics),
+    case vmq_subscriber:add(OldSubs, NewSubs) of
+        {NewSubs0, true} ->
+            vmq_subscriber_db:store(SubscriberId, NewSubs0);
         _ ->
             ok
     end.
+
+-spec subscriptions_exist(vmq_subscriber:subs(), [topic()]) -> [boolean()].
+subscriptions_exist(OldSubs, Topics) ->
+    [vmq_subscriber:exists(Topic, OldSubs) || {Topic, _} <- Topics].
 
 -spec del_subscriber(subscriber_id()) -> ok.
 del_subscriber(SubscriberId) ->
@@ -646,23 +673,23 @@ del_subscriptions(Topics, SubscriberId) ->
 %% the return value is used to inform the caller
 %% if a session was already present for the given
 %% subscriber id.
--spec maybe_remap_subscriber(subscriber_id(), map()) ->
+-spec maybe_remap_subscriber(subscriber_id(), boolean()) ->
     {boolean(), undefined | vmq_subscriber:subs(), [node()]}.
-maybe_remap_subscriber(SubscriberId, #{clean_session := true}) ->
+maybe_remap_subscriber(SubscriberId, _StartClean = true) ->
     %% no need to remap, we can delete this subscriber
     %% we overwrite any other value
     Subs = vmq_subscriber:new(true),
     vmq_subscriber_db:store(SubscriberId, Subs),
     {false, Subs, []};
-maybe_remap_subscriber(SubscriberId, #{clean_session := CleanSession}) ->
+maybe_remap_subscriber(SubscriberId, _StartClean = false) ->
     case vmq_subscriber_db:read(SubscriberId) of
         undefined ->
             %% Store empty Subscriber Data
-            Subs = vmq_subscriber:new(CleanSession),
+            Subs = vmq_subscriber:new(false),
             vmq_subscriber_db:store(SubscriberId, Subs),
             {false, Subs, []};
         Subs ->
-            case vmq_subscriber:change_node_all(Subs, node(), CleanSession) of
+            case vmq_subscriber:change_node_all(Subs, node(), false) of
                 {NewSubs, ChangedNodes} when length(ChangedNodes) > 0 ->
                     vmq_subscriber_db:store(SubscriberId, NewSubs),
                     {true, NewSubs, ChangedNodes};
@@ -711,3 +738,18 @@ status(SubscriberId) ->
             {ok, vmq_queue:status(QPid)}
     end.
 
+%% retain, pre-versioning
+%% {MPTopic, MsgOrDeleted}
+%% future version:
+%% {retain_msg, version, payload, properties, expiry_ts, ...}
+
+-define(RETAIN_PRE_V, 0).
+
+-spec retain_pre(binary() | tuple()) -> binary().
+retain_pre(Msg) when is_binary(Msg) ->
+    Msg;
+retain_pre(FutureRetain) when is_tuple(FutureRetain),
+                              element(1, FutureRetain) =:= retain_msg,
+                              is_integer(element(2, FutureRetain)),
+                              element(2, FutureRetain) > ?RETAIN_PRE_V ->
+    element(3, FutureRetain).

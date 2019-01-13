@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -20,7 +20,8 @@
 -export([start_link/0,
          ensure_cluster_node/1,
          get_cluster_node/1,
-         del_cluster_node/1]).
+         del_cluster_node/1,
+         node_status/1]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -77,6 +78,17 @@ get_cluster_node(Node) ->
             get_cluster_node(Node);
         {_, Pid, _, _} when is_pid(Pid) ->
             {ok, Pid}
+    end.
+
+-spec node_status(node()) -> init | up | down.
+node_status(Node) when Node == node() ->
+    up;
+node_status(Node) ->
+    case get_cluster_node(Node) of
+        {ok, Pid} when is_pid(Pid) ->
+            vmq_cluster_node:status(Pid);
+        _ ->
+            down
     end.
 
 %%%===================================================================

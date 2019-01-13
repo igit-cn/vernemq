@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,12 +17,11 @@
 
 -export([fold/5]).
 
--callback fold(MountPoint :: string(),
+-callback fold(SubscriberId :: subscriber_id(),
                Topic :: topic(),
-               FoldFun :: fun((node() | {subscriber_id(), qos()} , any()) -> any()),
+               FoldFun :: fun((node() | {subscriber_id(), qos(), client_id() | any()} , any()) -> any()),
                Accumulator :: any()
 
 ) -> any().
-
-fold(RegView, MountPoint, Topic, FoldFun, Acc) ->
-    RegView:fold(MountPoint, Topic, FoldFun, Acc).
+fold(RegView, SubscriberId, Topic, FoldFun, Acc) ->
+    RegView:fold(SubscriberId, Topic, FoldFun, Acc).

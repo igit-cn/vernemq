@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -14,6 +14,32 @@
 
 -module(vmq_diversity_utils).
 -compile([nowarn_export_all, export_all]).
+
+%% @doc change modifiers into a canonical form so it can be run
+%% through the modifier checker.
+normalize_modifiers(auth_on_subscribe_m5, Mods) ->
+    Mods1 =
+    lists:map(
+      fun({topics, Topics}) ->
+              {topics, normalize_subscribe_topics(Topics)}
+      end, Mods),
+    maps:from_list(Mods1);
+normalize_modifiers(auth_on_register_m5, Mods) ->
+    maps:from_list(Mods);
+normalize_modifiers(auth_on_publish_m5, Mods) ->
+    maps:from_list(Mods);
+normalize_modifiers(auth_on_subscribe, Mods) ->
+    normalize_subscribe_topics(Mods);
+normalize_modifiers(_Hook, Mods) ->
+    Mods.
+
+normalize_subscribe_topics(Topics0) ->
+    lists:map(
+      fun([T, [Q, SubOpts]]) ->
+              {T, {convert(Q), maps:from_list(SubOpts)}};
+         ([T, Q]) ->
+              {T, convert(Q)}
+      end, Topics0).
 
 convert(Val) when is_list(Val) ->
     convert_list(Val, []);
@@ -81,9 +107,15 @@ unmap([{K, Map}|Rest], Acc) when is_map(Map) ->
     unmap(Rest, [{K, unmap(Map)}|Acc]);
 unmap([{K, [Map|_] = Maps}|Rest], Acc) when is_map(Map) ->
     unmap(Rest, [{K, unmap(Maps)}|Acc]);
+unmap([{K, {A,B,C}=TS}|Rest], Acc)
+  when is_integer(A), is_integer(B), is_integer(C) ->
+    unmap(Rest, [{K, to_unixtime_millisecs(TS)}|Acc]);
 unmap([{K, V}|Rest], Acc) ->
     unmap(Rest, [{K, V}|Acc]);
 unmap([], Acc) -> lists:reverse(Acc).
+
+to_unixtime_millisecs({MegaSecs,Secs,MicroSecs}) ->
+    MegaSecs * 1000000000 + Secs * 1000 + MicroSecs div 1000.
 
 int(I) when is_integer(I) -> I;
 int(I) when is_number(I) -> round(I).

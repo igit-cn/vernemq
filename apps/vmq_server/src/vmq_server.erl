@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ start_no_auth(ClusterNode) ->
     _ = application:load(vmq_plugin),
     application:set_env(vmq_plugin, wait_for_proc, vmq_server_sup),
     _ = application:ensure_all_started(vmq_server),
-    plumtree_peer_service:join(ClusterNode).
+    vmq_peer_service:join(ClusterNode).
 
 
 start() ->
@@ -50,23 +50,31 @@ start() ->
 
 -spec stop() -> 'ok'.
 stop() ->
-    _ = [application:stop(App) || App <- [vmq_server,
+    application:stop(vmq_server),
+    wait_until_metadata_has_stopped(),
+    _ = [application:stop(App) || App <- [vmq_plugin,
+                                          riak_sysmon,
                                           clique,
-                                          plumtree,
-                                          jobs,
-                                          eleveldb,
-                                          vmq_server,
                                           asn1,
                                           public_key,
-                                          vmq_plugin,
                                           cowboy,
                                           ranch,
                                           crypto,
                                           ssl,
-                                          riak_sysmon,
                                           os_mon,
                                           lager]],
     ok.
+
+wait_until_metadata_has_stopped() ->
+    Impl = application:get_env(vmq_server, metadata_impl, vmq_plumtree),
+    case lists:keymember(Impl, 1, application:which_applications()) of
+        true ->
+            timer:sleep(100),
+            wait_until_metadata_has_stopped();
+        false ->
+            ok
+    end.
+
 
 maybe_start_distribution() ->
     case ets:info(sys_dist) of

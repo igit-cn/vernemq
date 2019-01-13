@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -88,9 +88,9 @@ get_env(App, Key, Default, IgnoreDBConfig) ->
             Val;
         [] when IgnoreDBConfig == false->
             Val =
-            case plumtree_metadata:get(?DB, {node(), App, Key}) of
+            case vmq_metadata:get(?DB, {node(), App, Key}) of
                 undefined ->
-                    case plumtree_metadata:get(?DB, {App, Key}) of
+                    case vmq_metadata:get(?DB, {App, Key}) of
                         undefined ->
                             application:get_env(App, Key, Default);
                         #vmq_config{val=GlobalVal} ->
@@ -120,9 +120,9 @@ get_all_env(App) ->
 get_prefixed_env(App, Key) ->
     case application:get_env(App, Key) of
         {ok, Val} ->
-            case plumtree_metadata:get(?DB, {node(), App, Key}) of
+            case vmq_metadata:get(?DB, {node(), App, Key}) of
                 undefined ->
-                    case plumtree_metadata:get(?DB, {App, Key}) of
+                    case vmq_metadata:get(?DB, {App, Key}) of
                         undefined ->
                             %% we only have what is stored inside the
                             %% application environment
@@ -159,14 +159,14 @@ set_env(Node, App, Key, Val, false) when Node == node() ->
     ok;
 set_env(Node, App, Key, Val, true) when Node == node() ->
     Rec =
-    case plumtree_metadata:get(?DB, {Node, App, Key}) of
+    case vmq_metadata:get(?DB, {Node, App, Key}) of
         undefined ->
             #vmq_config{key={Node, App, Key},
                         val=Val};
         Config ->
             Config#vmq_config{val=Val}
     end,
-    plumtree_metadata:put(?DB, {Node, App, Key}, Rec),
+    vmq_metadata:put(?DB, {Node, App, Key}, Rec),
     ets:insert(?TABLE, {{App, Key}, Val}),
     application:set_env(App, Key, Val),
     ok;
@@ -188,25 +188,25 @@ set_global_env(App, Key, Val, false) ->
     ok;
 set_global_env(App, Key, Val, true) ->
     Rec =
-    case plumtree_metadata:get(?DB, {App, Key}) of
+    case vmq_metadata:get(?DB, {App, Key}) of
         undefined ->
             #vmq_config{key={App, Key},
                         val=Val};
         Config ->
             Config#vmq_config{val=Val}
     end,
-    plumtree_metadata:put(?DB, {App, Key}, Rec),
+    vmq_metadata:put(?DB, {App, Key}, Rec),
     ets:insert(?TABLE, {{App, Key}, Val}),
     application:set_env(App, Key, Val),
     ok.
 
 
 unset_local_env(App, Key) ->
-    plumtree_metadata:delete(?DB, {node(), App, Key}),
+    vmq_metadata:delete(?DB, {node(), App, Key}),
     ok.
 
 unset_global_env(App, Key) ->
-    plumtree_metadata:delete(?DB, {App, Key}),
+    vmq_metadata:delete(?DB, {App, Key}),
     ok.
 
 
@@ -240,8 +240,6 @@ change_config(Configs) ->
     Env = filter_out_unchanged(VmqServerConfig, []),
     %% change reg configurations
     _ = validate_reg_config(Env, []),
-    %% change listener config
-    _ = validate_listener_config(Env, []),
     ok.
 
 filter_out_unchanged([{Key, Val} = Item|Rest], Acc) ->
@@ -371,15 +369,3 @@ validate_reg_config([], []) ->
     ok;
 validate_reg_config([], Acc) ->
     vmq_reg_sup:reconfigure_registry(Acc).
-
-validate_listener_config([{listeners, _} = Item|Rest], Acc) ->
-    validate_listener_config(Rest, [Item|Acc]);
-validate_listener_config([{tcp_listen_options, _} = Item|Rest], Acc) ->
-    validate_listener_config(Rest, [Item|Acc]);
-validate_listener_config([_|Rest], Acc) ->
-    validate_listener_config(Rest, Acc);
-validate_listener_config([], []) ->
-    %% no need to reconfigure listeners
-    ok;
-validate_listener_config([], Acc) ->
-    vmq_ranch_config:reconfigure_listeners(Acc).

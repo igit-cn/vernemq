@@ -30,6 +30,14 @@ distclean: clean relclean ballclean
 rpi32: PROFILE = as rpi32
 rpi32: rel
 
+swc:
+	# this instructs the rebar.config.script to adjust the relx config
+	VMQ_METADATA_IMPL=SWC $(MAKE) swc_rel
+
+swc_rel: PROFILE = as swc
+swc_rel: rel
+
+
 ##
 ## Test targets
 ##
@@ -53,7 +61,7 @@ test: compile testclean
 ##
 rel:
 ifeq ($(OVERLAY_VARS),)
-	$(REBAR) $(PROFILE) release --overlay_vars vars.config
+	$(REBAR) $(PROFILE) release
 else
 	cat vars.config > vars_pkg.config
 	cat $(OVERLAY_VARS) >> vars_pkg.config
@@ -81,35 +89,14 @@ dev% :
 	./gen_dev $@ vars/dev_vars.config.src vars/$@_vars.config
 	(./rebar3 as $@ release --overlay_vars vars/$@_vars.config)
 
+dev_swc% :
+	mkdir -p dev
+	./gen_dev $@ vars/dev_swc_vars.config.src vars/$@_vars.config
+	(export VMQ_METADATA_IMPL=SWC && ./rebar3 as swc,$@ release --overlay_vars vars/$@_vars.config)
+
+
 APPS = kernel stdlib sasl erts ssl tools os_mon runtime_tools crypto inets \
 	xmerl webtool snmp public_key mnesia eunit syntax_tools compiler
-COMBO_PLT = $(HOME)/.$(REPO)_combo_dialyzer_plt
-
-check_plt: compile
-	dialyzer --check_plt --plt $(COMBO_PLT) --apps $(APPS) \
-		_build/default/lib/*/ebin
-
-build_plt: compile
-	dialyzer --build_plt --output_plt $(COMBO_PLT) --apps $(APPS) \
-		_build/default/lib/*/ebin
-
-dialyzer: compile
-	@echo
-	@echo Use "'make check_plt'" to check PLT prior to using this target.
-	@echo Use "'make build_plt'" to build PLT prior to using this target.
-	@echo
-	@sleep 1
-	dialyzer -Wno_return --plt $(COMBO_PLT) deps/*/ebin | \
-	    fgrep -v -f ./dialyzer.ignore-warnings
-
-cleanplt:
-	@echo
-	@echo "Are you sure?  It takes about 1/2 hour to re-build."
-	@echo Deleting $(COMBO_PLT) in 5 seconds.
-	@echo
-	sleep 5
-	rm $(COMBO_PLT)
-
 
 ##
 ## Version and naming variables for distribution and packaging
@@ -173,18 +160,7 @@ get_dist_deps = mkdir distdir && \
                 LC_ALL=POSIX && export LC_ALL && sort $(MANIFEST_FILE) > $(MANIFEST_FILE).tmp && mv $(MANIFEST_FILE).tmp $(MANIFEST_FILE);
 
 
-# Name resulting directory & tar file based on current status of the git tag
-# If it is a tagged release (PKG_VERSION == MAJOR_VERSION), use the toplevel
-#   tag as the package name, otherwise generate a unique hash of all the
-#   dependencies revisions to make the package name unique.
-#   This enables the toplevel repository package to change names
-#   when underlying dependencies change.
-NAME_HASH = $(shell git hash-object distdir/$(CLONEDIR)/$(MANIFEST_FILE) 2>/dev/null | cut -c 1-8)
-ifeq ($(REVISION), $(MAJOR_VERSION))
 PKG_ID := $(REPO_TAG)
-else
-PKG_ID = $(REPO)-$(MAJOR_VERSION)-$(NAME_HASH)
-endif
 
 # To ensure a clean build, copy the CLONEDIR at a specific tag to a new directory
 #  which will be the basis of the src tar file (and packages)

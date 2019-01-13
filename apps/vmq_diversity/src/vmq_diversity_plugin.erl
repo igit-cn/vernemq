@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,6 +28,10 @@
 -behaviour(on_client_offline_hook).
 -behaviour(on_client_gone_hook).
 
+-behaviour(auth_on_register_m5_hook).
+-behaviour(auth_on_publish_m5_hook).
+-behaviour(auth_on_subscribe_m5_hook).
+
 -export([auth_on_register/5,
          auth_on_publish/6,
          auth_on_subscribe/3,
@@ -39,7 +43,10 @@
          on_offline_message/5,
          on_client_wakeup/1,
          on_client_offline/1,
-         on_client_gone/1]).
+         on_client_gone/1,
+         auth_on_register_m5/6,
+         auth_on_publish_m5/7,
+         auth_on_subscribe_m5/4]).
 
 
 %% API functions
@@ -195,13 +202,27 @@ code_change(_OldVsn, State, _Extra) ->
 auth_on_register(Peer, SubscriberId, UserName, Password, CleanSession) ->
     {PPeer, Port} = peer(Peer),
     {MP, ClientId} = subscriber_id(SubscriberId),
-    all_till_ok(auth_on_register, [{addr, PPeer},
-                                   {port, Port},
-                                   {mountpoint, MP},
-                                   {client_id, ClientId},
-                                   {username, nilify(UserName)},
-                                   {password, nilify(Password)},
-                                   {clean_session, CleanSession}]).
+    Res = all_till_ok(auth_on_register, [{addr, PPeer},
+                                         {port, Port},
+                                         {mountpoint, MP},
+                                         {client_id, ClientId},
+                                         {username, nilify(UserName)},
+                                         {password, nilify(Password)},
+                                         {clean_session, CleanSession}]),
+    conv_res(auth_on_reg, Res).
+
+auth_on_register_m5(Peer, SubscriberId, UserName, Password, CleanStart, Props) ->
+    {PPeer, Port} = peer(Peer),
+    {MP, ClientId} = subscriber_id(SubscriberId),
+    Res = all_till_ok(auth_on_register_m5, [{addr, PPeer},
+                                            {port, Port},
+                                            {mountpoint, MP},
+                                            {client_id, ClientId},
+                                            {username, nilify(UserName)},
+                                            {password, nilify(Password)},
+                                            {clean_start, CleanStart},
+                                            {properties, maps:to_list(Props)}]),
+    conv_res(auth_on_reg, Res).
 
 auth_on_publish(UserName, SubscriberId, QoS, Topic, Payload, IsRetain) ->
     {MP, ClientId} = subscriber_id(SubscriberId),
@@ -214,15 +235,40 @@ auth_on_publish(UserName, SubscriberId, QoS, Topic, Payload, IsRetain) ->
             {ok, Modifiers};
         false ->
             %% Found a valid cache entry which rejects this publish
-            error;
+            {error, not_authorized};
         no_cache ->
-            all_till_ok(auth_on_publish, [{username, nilify(UserName)},
-                                          {mountpoint, MP},
-                                          {client_id, ClientId},
-                                          {qos, QoS},
-                                          {topic, unword(Topic)},
-                                          {payload, Payload},
-                                          {retain, IsRetain}])
+            Res = all_till_ok(auth_on_publish, [{username, nilify(UserName)},
+                                                {mountpoint, MP},
+                                                {client_id, ClientId},
+                                                {qos, QoS},
+                                                {topic, unword(Topic)},
+                                                {payload, Payload},
+                                                {retain, IsRetain}]),
+            conv_res(auth_on_pub, Res)
+    end.
+
+auth_on_publish_m5(UserName, SubscriberId, QoS, Topic, Payload, IsRetain, Props) ->
+    {MP, ClientId} = subscriber_id(SubscriberId),
+    case vmq_diversity_cache:match_publish_acl(MP, ClientId, QoS, Topic, Payload, IsRetain) of
+        true ->
+            %% Found a valid cache entry which grants this publish
+            ok;
+        Modifiers when is_list(Modifiers) ->
+            %% Found a valid cache entry containing modifiers
+            {ok, Modifiers};
+        false ->
+            %% Found a valid cache entry which rejects this publish
+            {error, not_authorized};
+        no_cache ->
+            Res = all_till_ok(auth_on_publish_m5, [{username, nilify(UserName)},
+                                                   {mountpoint, MP},
+                                                   {client_id, ClientId},
+                                                   {qos, QoS},
+                                                   {topic, unword(Topic)},
+                                                   {payload, Payload},
+                                                   {retain, IsRetain},
+                                                   {properties, maps:to_list(Props)}]),
+            conv_res(auth_on_pub, Res)
     end.
 
 auth_on_subscribe(UserName, SubscriberId, Topics) ->
@@ -250,13 +296,54 @@ auth_on_subscribe(UserName, SubscriberId, Topics) ->
         false ->
             %% one of the provided topics doesn't match a cache entry which
             %% rejects this subscribe
-            error;
+            {error, not_authorized};
         no_cache ->
-            all_till_ok(auth_on_subscribe, [{username, nilify(UserName)},
-                                            {mountpoint, MP},
-                                            {client_id, ClientId},
-                                            {topics, [[unword(T), QoS]
-                                                      || {T, QoS} <- Topics]}])
+            Res = all_till_ok(auth_on_subscribe, [{username, nilify(UserName)},
+                                                  {mountpoint, MP},
+                                                  {client_id, ClientId},
+                                                  {topics, [[unword(T), QoS]
+                                                            || {T, QoS} <- Topics]}]),
+            conv_res(auth_on_sub, Res)
+    end.
+
+auth_on_subscribe_m5(UserName, SubscriberId, Topics, Props) ->
+    {MP, ClientId} = subscriber_id(SubscriberId),
+    CacheRet =
+    lists:foldl(
+      fun
+          (_, false) -> false;
+          (_, no_cache) -> no_cache;
+          ({Topic, SubInfo}, Acc) ->
+              QoS = extract_qos(SubInfo),
+              case vmq_diversity_cache:match_subscribe_acl(MP, ClientId, Topic, QoS) of
+                  Mods when is_list(Mods) ->
+                      Acc ++ Mods;
+                  Ret ->
+                      Ret
+              end
+      end, [], Topics),
+    case CacheRet of
+        true ->
+            %% all provided topics match a cache entry which grants this subscribe
+            ok;
+        Modifiers when is_list(Modifiers) ->
+            %% Found a valid cache entry containing modifiers
+            {ok, #{topics => Modifiers}};
+        false ->
+            %% one of the provided topics doesn't match a cache entry which
+            %% rejects this subscribe
+            {error, not_authorized};
+        no_cache ->
+            Unmap = fun(SubOpts) ->
+                            vmq_diversity_utils:unmap(SubOpts)
+                    end,
+            Res = all_till_ok(auth_on_subscribe_m5, [{username, nilify(UserName)},
+                                                     {mountpoint, MP},
+                                                     {client_id, ClientId},
+                                                     {topics, [[unword(T), [QoS, Unmap(SubOpts)]]
+                                                               || {T, {QoS, SubOpts}} <- Topics]},
+                                                     {properties, maps:to_list(Props)}]),
+            conv_res(auth_on_sub, Res)
     end.
 
 on_register(Peer, SubscriberId, UserName) ->
@@ -386,16 +473,20 @@ all_till_ok([Pid|Rest], HookName, Args) ->
     case vmq_diversity_script:call_function(Pid, HookName, Args) of
         true ->
             ok;
-        Modifiers when is_list(Modifiers) ->
-            case vmq_plugin_util:check_modifiers(HookName, Modifiers) of
-                error -> error;
+        Mods0 when is_list(Mods0) ->
+            Mods1 = normalize_modifiers(HookName, Mods0),
+            case vmq_plugin_util:check_modifiers(HookName, Mods1) of
+                error ->
+                    {error, {invalid_modifiers, Mods1}};
                 CheckedModifiers ->
                     {ok, CheckedModifiers}
             end;
         false ->
-            error;
+            {error, lua_script_returned_false};
         error ->
-            error;
+            {error, lua_script_error};
+        {error, Reason} ->
+            {error, Reason};
         _ ->
             all_till_ok(Rest, HookName, Args)
     end;
@@ -433,3 +524,16 @@ nilify(undefined) ->
 nilify(Val) ->
     Val.
 
+extract_qos({QoS, _SubInfo}) -> QoS;
+extract_qos(QoS) when is_integer(QoS) -> QoS.
+
+normalize_modifiers(Hook, Mods) ->
+    vmq_diversity_utils:normalize_modifiers(Hook, Mods).
+
+conv_res(auth_on_reg, {error, lua_script_returned_false}) ->
+    {error, invalid_credentials};
+conv_res(auth_on_pub, {error, lua_script_returned_false}) ->
+    {error, not_authorized};
+conv_res(auth_on_sub, {error, lua_script_returned_false}) ->
+    {error, not_authorized};
+conv_res(_, Other) -> Other.

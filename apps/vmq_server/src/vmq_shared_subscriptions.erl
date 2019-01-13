@@ -1,4 +1,4 @@
-%% Copyright 2017 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ publish(Msg, Policy, [{Group, []}|Rest]) ->
 publish(Msg, Policy, [{Group, SubscriberGroup}|Rest]) ->
     Subscribers = filter_subscribers(SubscriberGroup, Policy),
     %% Randomize subscribers once.
-    RandSubscribers = [S||{_,S} <- lists:sort([{rnd:uniform(), N} || N <- Subscribers])],
+    RandSubscribers = [S||{_,S} <- lists:sort([{rand:uniform(), N} || N <- Subscribers])],
     case publish_to_group(Msg, RandSubscribers) of
         ok ->
             publish(Msg, Policy, Rest);
@@ -57,7 +57,7 @@ publish_online(Msg, Subscribers) ->
                       _ ->
                           Acc
                   end
-          end, Subscribers, [])
+          end, [], Subscribers)
     catch
         done -> ok
     end.
@@ -85,7 +85,7 @@ publish_(Msg, {Node, SubscriberId, QoS}, QState) when Node == node() ->
     end;
 publish_(Msg, {Node, SubscriberId, QoS}, QState) ->
     Term = {enqueue_many, SubscriberId, [{deliver, QoS, Msg}], #{states => [QState]}},
-    vmq_cluster:remote_enqueue(Node, Term).
+    vmq_cluster:remote_enqueue(Node, Term, true).
 
 filter_subscribers(Subscribers, random) ->
     Subscribers;

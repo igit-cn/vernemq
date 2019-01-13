@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %% 
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 %% ===================================================================
 
 start(_StartType, _StartArgs) ->
+    vmq_bridge_cli:register_cli(),
     vmq_bridge_sup:start_link().
 
 stop(_State) ->

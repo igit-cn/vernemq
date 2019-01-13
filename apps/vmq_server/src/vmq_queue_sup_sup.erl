@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -34,29 +34,7 @@
 %%====================================================================
 
 start_link(Shutdown, MaxR, MaxT) ->
-    case supervisor:start_link({local, ?SERVER}, ?MODULE, [Shutdown, MaxR, MaxT]) of
-        {ok, Pid} = Ret ->
-            %% Create queues from persisted data
-            {InitPid, MRef} = spawn_monitor(vmq_reg, fold_subscribers,
-                                            [fun fold_subscribers/3, ok]),
-            receive
-                {'DOWN', MRef, process, InitPid, normal} ->
-                    Ret;
-                {'DOWN', MRef, process, InitPid, Reason} ->
-                    exit(Pid, kill),
-                    {error, {init_error, Reason}}
-            end;
-        {error, Error} ->
-            {error, Error}
-    end.
-
-fold_subscribers(SubscriberId, Nodes, Acc) ->
-    case lists:member(node(), Nodes) of
-        true ->
-            start_queue(SubscriberId, false);
-        false ->
-            Acc
-    end.
+    supervisor:start_link({local, ?SERVER}, ?MODULE, [Shutdown, MaxR, MaxT]).
 
 %%====================================================================
 %% Supervisor callbacks
@@ -73,12 +51,12 @@ init([Shutdown, MaxR, MaxT]) ->
                  {vmq_queue_sup, start_link, [Shutdown, RegName, QueueTabId, MaxR, MaxT]},
                  permanent, 5000, supervisor, [vmq_queue_sup]}
         end,
-                    
+
     ChildSpecs =
         [ChildSpec(
            gen_sup_name(N),
            gen_queue_tab_id(N))
-         || N <- lists:seq(1,NumSups)],
+         || N <- lists:seq(0, NumSups)],
     {ok, {SupFlags, ChildSpecs}}.
 %%====================================================================
 %% Internal functions
@@ -100,18 +78,16 @@ num_child_sups() ->
     application:get_env(vmq_server, queue_sup_sup_children, 50).
 
 subscriberid_to_supname(SubscriberId) ->
-    gen_sup_name(erlang:phash2(SubscriberId, num_child_sups()) + 1).
+    gen_sup_name(erlang:phash2(SubscriberId, num_child_sups())).
 
 subscriberid_to_tabid(SubscriberId) ->
-    gen_queue_tab_id(erlang:phash2(SubscriberId, num_child_sups()) + 1).
+    gen_queue_tab_id(erlang:phash2(SubscriberId, num_child_sups())).
 
 gen_queue_tab_id(N) ->
-    TabId = <<"vmq_queue_sup_", (integer_to_binary(N))/binary, "_tab">>,
-    erlang:binary_to_atom(TabId, latin1).
+    list_to_atom("vmq_queue_tab_" ++ integer_to_list(N)).
 
 gen_sup_name(N) ->
-    TabId = <<"vmq_queue_sup_", (integer_to_binary(N))/binary>>,
-    erlang:binary_to_atom(TabId, latin1).
+    list_to_atom("vmq_queue_sup_" ++ integer_to_list(N)).
 
 get_queue_pid(SubscriberId) ->
     QueueTabId = subscriberid_to_tabid(SubscriberId),
@@ -122,7 +98,7 @@ fold_queues(FoldFun, Acc) ->
       fun(QueueTabId, AccAcc) ->
               vmq_queue_sup:fold_queues(QueueTabId, FoldFun, AccAcc)
       end,
-      Acc, 
+      Acc,
       child_tab_ids()).
 
 summary() ->
@@ -148,9 +124,9 @@ summary() ->
       end, {0, 0, 0, 0, 0}).
 
 child_tab_ids() ->
-    [ gen_queue_tab_id(N) || N <- lists:seq(1, num_child_sups()) ].
+    [ gen_queue_tab_id(N) || N <- lists:seq(0, num_child_sups()) ].
 
 nr_of_queues() ->
     lists:sum(
-      [vmq_queue_sup:nr_of_queues(QueueTabId) || QueueTabId <-child_tab_ids()]
+      [vmq_queue_sup:nr_of_queues(QueueTabId) || QueueTabId <- child_tab_ids()]
      ).

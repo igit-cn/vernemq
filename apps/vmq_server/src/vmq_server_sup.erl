@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -44,7 +44,6 @@ init([]) ->
     {ok, MsgStoreChildSpecs} = application:get_env(vmq_server, msg_store_childspecs),
 
     maybe_change_nodename(),
-    purge_stale_subscriber_data(),
 
     {ok, { {one_for_one, 5, 10},
            [?CHILD(vmq_config, worker, []) | MsgStoreChildSpecs]
@@ -54,63 +53,22 @@ init([]) ->
                ?CHILD(vmq_reg_sup, supervisor, []),
                ?CHILD(vmq_cluster_node_sup, supervisor, []),
                ?CHILD(vmq_sysmon, worker, []),
-               ?CHILD(vmq_metrics_sup, supervisor, [])
+               ?CHILD(vmq_metrics_sup, supervisor, []),
+               ?CHILD(vmq_ranch_sup, supervisor, [])
               ]} }.
 
 maybe_change_nodename() ->
-    {ok, LocalState} = plumtree_peer_service_manager:get_local_state(),
-    case riak_dt_orswot:value(LocalState) of
+    case vmq_peer_service:members() of
         [Node] when Node =/= node() ->
             lager:info("rename VerneMQ node from ~p to ~p", [Node, node()]),
-            {ok, Actor} = plumtree_peer_service_manager:get_actor(),
-            {ok, Merged} = riak_dt_orswot:update({update, [{remove, Node},
-                                                           {add, node()}]}, Actor, LocalState),
-            _ = gen_server:cast(plumtree_peer_service_gossip, {receive_state, Merged}),
+            _ = vmq_peer_service:rename_member(Node, node()),
             vmq_reg:fold_subscribers(
               fun(SubscriberId, Subs, _) ->
                       {NewSubs, _} = vmq_subscriber:change_node_all(Subs, node(), false),
                       vmq_subscriber_db:store(SubscriberId, NewSubs)
-              end, ignored, false);
+              end, ignored);
         _ ->
             %% we ignore if the node has the same name
             %% or if more than one node is returned (clustered)
             ignore
     end.
-
-
-purge_stale_subscriber_data() ->
-    Node = node(),
-    FoldFun = fun(SubscriberId,Subs,_) ->
-                      SortedSubs =
-                          lists:foldl(fun({N, _, _}, AccAcc) when Node =/= N ->
-                                              AccAcc;
-                                         ({_N, CS, InnerSubs}, {CSFAcc, CSTAcc}) ->
-                                              Topics = [T || {T,_} <- InnerSubs],
-                                              case CS of
-                                                  true ->
-                                                      {CSFAcc,[Topics|CSTAcc]};
-                                                  false ->
-                                                      {[Topics|CSFAcc],CSTAcc}
-                                              end
-                                      end,
-                                      {[], []},
-                                      Subs),
-                      case SortedSubs of
-                          {[],_} ->
-                              vmq_reg:delete_subscriptions(SubscriberId);
-                          {_,CST} ->
-                              lists:foreach(
-                                fun(Topics) ->
-                                        OldSubs = vmq_subscriber_db:read(SubscriberId, []),
-                                        case vmq_subscriber:remove(OldSubs, Topics) of
-                                            {NewSubs, true} ->
-                                                vmq_subscriber_db:store(SubscriberId, NewSubs);
-                                            _ ->
-                                                ok
-                                        end
-                                end,
-                                CST)
-                      end,
-                      ignore
-              end,
-    vmq_reg:fold_subscribers(FoldFun, [], false).

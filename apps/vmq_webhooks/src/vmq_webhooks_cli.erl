@@ -1,4 +1,4 @@
-%% Copyright 2017 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,11 +17,22 @@
 -behaviour(clique_handler).
 
 register_cli() ->
+    register_config(),
     register_cli_usage(),
     status_cmd(),
     register_cmd(),
     cache_stats_cmd(),
     deregister_cmd().
+
+register_config() ->
+    ConfigKeys =
+    ["vmq_webhooks.pool_max_connections", "vmq_webhooks.pool_timeout"],
+    [clique:register_config([Key], fun register_config_callback/3)
+     || Key <- ConfigKeys],
+    ok = clique:register_config_whitelist(ConfigKeys).
+
+register_config_callback(_, _, _) ->
+    ok.
 
 cache_stats_cmd() ->
     Cmd = ["vmq-admin", "webhooks", "cache", "show"],
@@ -138,7 +149,16 @@ hook_keyspec() ->
                                         "on_offline_message",
                                         "on_client_wakeup",
                                         "on_client_offline",
-                                        "on_client_gone"]) of
+                                        "on_client_gone",
+                                        "auth_on_register_m5",
+                                        "auth_on_publish_m5",
+                                        "auth_on_subscribe_m5",
+                                        "on_register_m5",
+                                        "on_publish_m5",
+                                        "on_subscribe_m5",
+                                        "on_unsubscribe_m5",
+                                        "on_deliver_m5",
+                                        "on_auth_m5"]) of
                          true ->
                              binary_to_atom(list_to_binary(Hook), utf8);
                          _ -> {error, {invalid_value, Hook}}

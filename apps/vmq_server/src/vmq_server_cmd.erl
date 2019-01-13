@@ -60,18 +60,18 @@ listener_stop(Port, Address) ->
     listener_stop(Port, Address, false).
 listener_stop(Port, Address, false) when is_integer(Port) and is_list(Address) ->
     vmq_server_cli:command(["vmq-admin", "listener", "stop",
-                            "port", integer_to_list(Port),
-                            "address", Address], false);
+                            "port=" ++ integer_to_list(Port),
+                            "address=" ++ Address], false);
 listener_stop(Port, Address, true) when is_integer(Port) and is_list(Address) ->
     vmq_server_cli:command(["vmq-admin", "listener", "stop",
-                            "port", integer_to_list(Port),
-                            "address", Address,
+                            "port=" ++ integer_to_list(Port),
+                            "address=" ++ Address,
                             "--kill_sessions"], false).
 
 listener_delete(Port, Address) when is_integer(Port) and is_list(Address) ->
     vmq_server_cli:command(["vmq-admin", "listener", "delete",
-                            "port", integer_to_list(Port),
-                            "address", Address], false).
+                            "port=" ++ integer_to_list(Port),
+                            "address=" ++ Address], false).
 
 metrics() ->
     vmq_server_cli:command(["vmq-admin", "metrics", "show"], false).
@@ -80,9 +80,6 @@ metrics() ->
 convert_listener_options([{K, true}|Rest], Acc) ->
     %% e.g. "--websocket"
     convert_listener_options(Rest, ["--" ++ atom_to_list(K) | Acc]);
-convert_listener_options([{_K, false}|Rest], Acc) ->
-    %% setting Val == false is the same as not setting the prop at all
-    convert_listener_options(Rest, Acc);
 convert_listener_options([{K, V}|Rest], Acc) when is_atom(V) ->
     convert_listener_options(Rest, ["--" ++ atom_to_list(K), atom_to_list(V) | Acc]);
 convert_listener_options([{K, V}|Rest], Acc) when is_integer(V) ->

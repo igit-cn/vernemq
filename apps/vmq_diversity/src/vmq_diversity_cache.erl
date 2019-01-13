@@ -1,4 +1,4 @@
-%% Copyright 2017 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 
 -module(vmq_diversity_cache).
 
+-dialyzer(no_undefined_callbacks).
 -behaviour(gen_server2).
 
 %% API
@@ -308,21 +309,22 @@ validate_acl(MP, User, ClientId, Rec, [UnknownProp|Rest]) ->
     validate_acl(MP, User, ClientId, Rec, Rest);
 validate_acl(_, _, _, Rec, []) -> Rec.
 
-validate_modifiers(Type, Modifiers) ->
-    NewModifiers = vmq_diversity_utils:convert(Modifiers),
+validate_modifiers(Type, Mods0) ->
+    Mods1 = vmq_diversity_utils:convert(Mods0),
     Ret =
     case Type of
         publish ->
-            vmq_plugin_util:check_modifiers(auth_on_publish, NewModifiers);
+            vmq_plugin_util:check_modifiers(auth_on_publish, Mods1);
         subscribe ->
             %% massage the modifiers to take the same form as it were returned by
             %% the callback directly
             %% in Lua: { {topic, qos}, ... }
-            vmq_plugin_util:check_modifiers(auth_on_subscribe, NewModifiers)
+            Mods2 = vmq_diversity_utils:normalize_subscribe_topics(Mods1),
+            vmq_plugin_util:check_modifiers(auth_on_subscribe, Mods2)
     end,
     case Ret of
         error ->
-            lager:error("can't validate modifiers ~p for ~p ACL", [Type, Modifiers]),
+            lager:error("can't validate modifiers ~p for ~p ACL", [Type, Mods0]),
             undefined;
         _ ->
             Ret

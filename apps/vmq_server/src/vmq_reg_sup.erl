@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -67,7 +67,7 @@ install_reg_views([RV|RegViews]) ->
             lager:info("installed reg view ~p", [RV]),
             install_reg_views(RegViews);
         {error, Reason} ->
-            lager:error("can't install reg view due to ~p", [RV, Reason]),
+            lager:error("can't install reg view ~p due to ~p", [RV, Reason]),
             install_reg_views(RegViews)
     end;
 install_reg_views([]) -> ok.
@@ -75,7 +75,7 @@ install_reg_views([]) -> ok.
 uninstall_reg_views([RV|RegViews]) ->
     case stop_reg_view(RV) of
         {error, Reason} ->
-            lager:error("can't uninstall reg view due to ~p", [RV, Reason]),
+            lager:error("can't uninstall reg view ~p due to ~p", [RV, Reason]),
             uninstall_reg_views(RegViews);
         _ ->
             lager:info("uninstalled reg view ~p", [RV]),

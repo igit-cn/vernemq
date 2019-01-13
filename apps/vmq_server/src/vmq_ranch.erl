@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@
 -export([system_terminate/4]).
 -export([system_code_change/4]).
 
+-define(TO_SESSION, to_session_fsm).
+
 -record(st, {socket,
              buffer= <<>>,
              fsm_mod,
@@ -44,7 +46,7 @@ init(Ref, Parent, Socket, Transport, Opts) ->
     ok = ranch:accept_ack(Ref),
     case Transport:peername(Socket) of
         {ok, Peer} ->
-            FsmMod = proplists:get_value(fsm_mod, Opts, vmq_mqtt_fsm),
+            FsmMod = proplists:get_value(fsm_mod, Opts, vmq_mqtt_pre_init),
             FsmState =
             case Transport of
                 ranch_ssl ->
@@ -61,7 +63,12 @@ init(Ref, Parent, Socket, Transport, Opts) ->
                         undefined ->
                             FsmMod:init(NewPeer, Opts);
                         CN ->
-                            FsmMod:init(NewPeer, [{preauth, CN}|Opts])
+                            case proplists:get_value(proxy_protocol_use_cn_as_username, Opts, true) of
+                                false ->
+                                    FsmMod:init(NewPeer, Opts);
+                                true ->
+                                    FsmMod:init(NewPeer, [{preauth, CN}|Opts])
+                            end
                     end;
                 _ ->
                     FsmMod:init(Peer, Opts)
@@ -82,6 +89,10 @@ init(Ref, Parent, Socket, Transport, Opts) ->
                      fsm_mod=FsmMod,
                      proto_tag=Transport:messages(),
                      parent=Parent});
+        {error, enotconn} ->
+            %% If the client already disconnected we don't want to
+            %% know about it - it's not an error.
+            ok;
         {error, Reason} ->
             lager:debug("could not get socket peername: ~p", [Reason]),
             %% It's not really "ok", but there's no reason for the
@@ -161,6 +172,17 @@ handle_message({Proto, _, Data}, #st{proto_tag={Proto, _, _}, fsm_mod=FsmMod} = 
     NrOfBytes = byte_size(Data),
     _ = vmq_metrics:incr_bytes_received(NrOfBytes),
     case FsmMod:data_in(<<Buffer/binary, Data/binary>>, FsmState0) of
+        {switch_fsm, NewFsmMod, FsmState1, Rest, Out} ->
+            case active_once(Socket) of
+                ok ->
+                    maybe_flush(State#st{fsm_mod=NewFsmMod,
+                                         fsm_state=FsmState1,
+                                         pending=[Pending|Out],
+                                         buffer=Rest});
+                {error, Reason} ->
+                    {exit, Reason, State#st{pending=[Pending|Out],
+                                            fsm_state=FsmState1}}
+            end;
         {ok, FsmState1, Rest, Out} ->
             case active_once(Socket) of
                 ok ->
@@ -173,8 +195,8 @@ handle_message({Proto, _, Data}, #st{proto_tag={Proto, _, _}, fsm_mod=FsmMod} = 
             end;
         {stop, Reason, Out} ->
             {exit, Reason, State#st{pending=[Pending|Out]}};
-        {throttle, FsmState1, Rest, Out} ->
-            erlang:send_after(1000, self(), restart_work),
+        {throttle, MilliSecs, FsmState1, Rest, Out} ->
+            erlang:send_after(MilliSecs, self(), restart_work),
             maybe_flush(State#st{fsm_state=FsmState1,
                                  pending=[Pending|Out],
                                  throttled=true,
@@ -190,12 +212,12 @@ handle_message({Proto, _, Data}, #st{proto_tag={Proto, _, _}, fsm_mod=FsmMod} = 
     end;
 handle_message({ProtoClosed, _}, #st{proto_tag={_, ProtoClosed, _}, fsm_mod=FsmMod} = State) ->
     %% we regard a tcp_closed as 'normal'
-    _ = FsmMod:msg_in(disconnect, State#st.fsm_state),
+    _ = FsmMod:msg_in({disconnect, ?NORMAL_DISCONNECT}, State#st.fsm_state),
     {exit, normal, State};
 handle_message({ProtoErr, _, Error}, #st{proto_tag={_, _, ProtoErr}} = State) ->
     _ = vmq_metrics:incr_socket_error(),
     {exit, Error, State};
-handle_message({FsmMod, Msg}, #st{pending=Pending, fsm_state=FsmState0, fsm_mod=FsmMod} = State) ->
+handle_message({?TO_SESSION, Msg}, #st{pending=Pending, fsm_state=FsmState0, fsm_mod=FsmMod} = State) ->
     case FsmMod:msg_in(Msg, FsmState0) of
         {ok, FsmState1, Out} ->
             maybe_flush(State#st{fsm_state=FsmState1,
@@ -214,7 +236,8 @@ handle_message(restart_work, #st{throttled=true} = State) ->
     #st{proto_tag={Proto, _, _}, socket=Socket} = State,
     handle_message({Proto, Socket, <<>>}, State#st{throttled=false});
 handle_message({'EXIT', _Parent, Reason}, #st{fsm_state=FsmState0, fsm_mod=FsmMod} = State) ->
-    _ = FsmMod:msg_in(disconnect, FsmState0),
+    %% TODO: this should probably not be a normal disconnect...
+    _ = FsmMod:msg_in({disconnect, ?NORMAL_DISCONNECT}, FsmState0),
     {exit, Reason, State};
 handle_message({system, From, Request}, #st{parent=Parent}= State) ->
     sys:handle_system_msg(Request, From, Parent, ?MODULE, [], State);

@@ -2,6 +2,8 @@
 -include("vmq_types.hrl").
 -export([parse/1, parse/2, serialise/1]).
 
+-dialyzer({no_match, utf8/1}).
+
 -export([gen_connect/2,
          gen_connack/0,
          gen_connack/1,
@@ -137,7 +139,6 @@ variable(<<?CONNECT:4, 0:4>>, <<L:16/big, PMagic:L/binary, _/binary>>)
   when not ((PMagic == ?PROTOCOL_MAGIC_311) or
              (PMagic == ?PROTOCOL_MAGIC_31)) ->
     {error, unknown_protocol_magic};
-
 variable(<<?CONNECT:4, 0:4>>,
     <<L:16/big, _:L/binary, ProtoVersion:8,
       UserNameFlag:1, PasswordFlag:1, WillRetain:1, WillQos:2, WillFlag:1,

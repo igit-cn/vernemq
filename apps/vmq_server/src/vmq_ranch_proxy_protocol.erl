@@ -31,6 +31,13 @@
 -module(vmq_ranch_proxy_protocol).
 -behaviour(ranch_transport).
 
+%% apps/vmq_server/src/vmq_ranch_proxy_protocol.erl
+%%  273: The specified type for the 4th argument of connect/4 ([{'dest_address',{byte(),byte(),byte(),byte()} | {char(),char(),char(),char(),char(),char(),char(),char()}} | {'dest_port',char()} | {'source_address',{byte(),byte(),byte(),byte()} | {char(),char(),char(),char(),char(),char(),char(),char()}} | {'source_port',char()}]) is not a supertype of 'infinity' | non_neg_integer(), which is expected type for this argument in the callback of the ranch_transport behaviour
+%%
+%% The warning is correct: this is clearly a violation of the ranch
+%% type spec, but we can't do anything about it:
+-dialyzer(no_behaviours).
+
 -export([name/0,
          secure/0,
          messages/0,
@@ -51,7 +58,6 @@
          sockname/1,
          shutdown/2,
          close/1,
-         opts_from_socket/1,
          bearer_port/1,
          listen_port/1,
          match_port/1,
@@ -187,7 +193,7 @@ listen(Opts) ->
     case ranch_tcp:listen(Opts) of
         {ok, LSocket} ->
             {ok, #proxy_socket{lsocket   = LSocket,
-                               opts      = Opts}};
+                               opts      = filter(Opts)}};
         {error, Error} ->
             {error, Error}
     end.
@@ -195,9 +201,9 @@ listen(Opts) ->
 -spec accept(proxy_socket(), timeout())
             -> {ok, proxy_socket()} | {error, closed | timeout |
                                        not_proxy_protocol |
-                                       {timeout, proxy_handshake} | atom()}.
+                                       proxy_handshake_timeout | atom()}.
 accept(#proxy_socket{lsocket = LSocket,
-                                opts = Opts}, Timeout) ->
+                     opts = Opts}, Timeout) ->
     Started = os:timestamp(),
     case ranch_tcp:accept(LSocket, Timeout) of
         {ok, CSocket} ->
@@ -255,7 +261,7 @@ accept(#proxy_socket{lsocket = LSocket,
                     {error, Other}
             after NextWait ->
                     close(ProxySocket),
-                    {error, {timeout, proxy_handshake}}
+                    {error, proxy_handshake_timeout}
             end;
         {error, Error} ->
             {error, Error}
@@ -366,17 +372,6 @@ shutdown(#proxy_socket{csocket=Socket}, How) ->
 -spec close(proxy_socket()) -> ok.
 close(#proxy_socket{csocket=Socket}) ->
     ranch_tcp:close(Socket).
-
--spec opts_from_socket(proxy_socket()) ->
-                              ranch_proxy_protocol:proxy_opts().
-opts_from_socket(Socket) ->
-    case {source_from_socket(Socket),
-          dest_from_socket(Socket)} of
-        {{ok, Src}, {ok, Dst}} ->
-            {ok, Src ++ Dst};
-        {{error, _} = Err, _} -> Err;
-        {_, {error, _} = Err} -> Err
-    end.
 
 -spec bearer_port(proxy_socket()) -> port().
 bearer_port(#proxy_socket{csocket = Port}) ->
@@ -569,18 +564,14 @@ get_next_timeout(T1, T2, Timeout) ->
     TimeUsed = round(timer:now_diff(T2, T1) / 1000),
     erlang:max(?DEFAULT_PROXY_TIMEOUT, Timeout - TimeUsed).
 
-source_from_socket(Socket) ->
-    case ranch_tcp:peername(Socket) of
-        {ok, {Addr, Port}} ->
-            {ok, [{source_address, Addr},
-                  {source_port, Port}]};
-        Err -> Err
-    end.
+filter(Opts) ->
+    filter(Opts, []).
 
-dest_from_socket(Socket) ->
-    case ranch_tcp:sockname(Socket) of
-        {ok, {Addr, Port}} ->
-            {ok, [{dest_address, Addr},
-                  {dest_port, Port}]};
-        Err -> Err
-    end.
+filter([], Acc) ->
+    lists:reverse(Acc);
+filter([{ip,_}|Rest], Acc) ->
+    filter(Rest, Acc);
+filter([{port, _}|Rest], Acc) ->
+    filter(Rest, Acc);
+filter([O|Rest], Acc) ->
+    filter(Rest, [O|Acc]).

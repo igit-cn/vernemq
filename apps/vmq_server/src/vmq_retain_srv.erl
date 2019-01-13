@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 -module(vmq_retain_srv).
 
+-dialyzer(no_undefined_callbacks).
 -behaviour(gen_server2).
 
 %% API functions
@@ -125,13 +126,13 @@ stats() ->
 %% @end
 %%--------------------------------------------------------------------
 init([]) ->
-    plumtree_metadata_manager:subscribe(?RETAIN_DB),
-    plumtree_metadata:fold(
+    vmq_metadata:subscribe(?RETAIN_DB),
+    vmq_metadata:fold(?RETAIN_DB,
       fun({MPTopic, '$deleted'}, _) ->
               ets:delete(?RETAIN_CACHE, MPTopic);
          ({MPTopic, Msg}, _) ->
               ets:insert(?RETAIN_CACHE, [{MPTopic, Msg}])
-      end, ok, ?RETAIN_DB, [{resolver, lww}]),
+      end, ok),
     erlang:send_after(vmq_config:get_env(retain_persist_interval, 1000),
                       self(), persist),
     {ok, #state{}}.
@@ -223,9 +224,9 @@ persist({Key, Counter}, _) ->
     case ets:lookup(?RETAIN_CACHE, Key) of
         [] ->
             %% cache line was deleted
-            plumtree_metadata:delete(?RETAIN_DB, Key);
+            vmq_metadata:delete(?RETAIN_DB, Key);
         [{_, Message}] ->
-            plumtree_metadata:put(?RETAIN_DB, Key, Message)
+            vmq_metadata:put(?RETAIN_DB, Key, Message)
     end,
     %% If a concurrent insert happened during the fold then the
     %% current counter value will be bigger than Counter, So

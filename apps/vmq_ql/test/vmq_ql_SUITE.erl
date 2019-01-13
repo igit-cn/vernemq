@@ -11,12 +11,11 @@
          query_select_all_test/1,
          query_select_by_id_test/1,
          query_select_match_test/1,
-         query_select_by_atom_test/1,
          query_select_by_pid_test/1
         ]).
 
 %% vmq_ql exports
--export([fields_config/0, fold_init_rows/3]).
+-export([fields_config/0, fold_init_rows/4]).
 
 -include("vmq_ql.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -29,7 +28,6 @@ all() ->
      query_select_all_test,
      query_select_by_id_test,
      query_select_match_test,
-     query_select_by_atom_test,
      query_select_by_pid_test
     ].
 
@@ -77,11 +75,6 @@ query_select_match_test(_) ->
     Pid =  query(Query),
     [{1, #{module := ?MODULE}}] = fetch(Pid, 10).
 
-query_select_by_atom_test(_) ->
-    Query = "SELECT * FROM modules WHERE module = \"" ++ atom_to_list(?MODULE) ++ "\"",
-    Pid =  query(Query),
-    [{1, #{module := ?MODULE}}] = fetch(Pid, 10).
-
 query_select_by_pid_test(_) ->
     [QPid|_] = erlang:processes(),
     Query = "SELECT * FROM proc WHERE pid = \"" ++ pid_to_list(QPid) ++ "\"",
@@ -122,12 +115,12 @@ fields_config() ->
              },
     [Foo, Bar, Mods].
 
-fold_init_rows(foobar, Fun, Acc) ->
+fold_init_rows(foobar, Fun, Acc,_) ->
     lists:foldl(fun(I, AccAcc) ->
                         InitRow = #{id => I},
                         Fun(InitRow, AccAcc)
                 end, Acc, lists:seq(1, ?NR_SAMPLES));
-fold_init_rows(modules, Fun, Acc) ->
+fold_init_rows(modules, Fun, Acc,_) ->
     lists:foldl(fun({Mod, Path}, AccAcc) ->
                         InitRow = #{module => Mod, path => Path},
                         Fun(InitRow, AccAcc)

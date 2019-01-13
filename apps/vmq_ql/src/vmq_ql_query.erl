@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -33,10 +33,16 @@
 -export([required_fields/1, include_fields/2]).
 
 -callback fields_config() -> [info_table()].
--callback fold_init_rows(atom(), function(), any()) -> any().
+-callback fold_init_rows(atom(), function(), any(), list(map())) -> any().
 
 -record(state, {mgr, query, next, result_table}).
 -define(ROWQUERYTIMEOUT, 100).
+
+-ifdef(fun_stacktrace).
+-define(WITH_STACKTRACE(T, R, S), T:R -> S = erlang:get_stacktrace(),).
+-else.
+-define(WITH_STACKTRACE(T, R, S), T:R:S ->).
+-endif.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -51,11 +57,15 @@ start_link(Mgr, QueryString) ->
     gen_server:start_link(?MODULE, [Mgr, QueryString], []).
 
 fetch(Pid, Ordering, Limit) ->
-    try
-        gen_server:call(Pid, {fetch, Ordering, Limit}, infinity)
-    catch
-        exit:{noproc, _} ->
-            []
+    case catch gen_server:call(Pid, {fetch, Ordering, Limit}, infinity) of
+        {'EXIT', {normal, _}} ->
+            [];
+        {'EXIT', {noproc, _}} ->
+            [];
+        {'EXIT', Reason} ->
+            exit(Reason);
+        Ret ->
+            Ret
     end.
 
 %%%===================================================================
@@ -136,6 +146,8 @@ internal_query(Str) ->
     try vmq_ql_parser:parse(Str) of
         {fail, E} ->
             {error, E};
+        {_Parsed,Unparsed,Loc} ->
+            {error, {parse_error,Unparsed,Loc}};
         Parsed when is_list(Parsed) ->
             eval(proplists:get_value(type, Parsed), Parsed)
     catch
@@ -197,14 +209,14 @@ select(Fields, From, Where, OrderBy, Limit, RowQueryTimeout) ->
                           lager:warning("Subquery failed due to timeout"),
                           Idx
                   end
-          end, 1)
+          end, 1, dnf_hint(Where))
     catch
         exit:enough_data ->
             %% Raising inside an ets:fold allows us to stop the fold
             ok;
-        E1:R1 ->
+        ?WITH_STACKTRACE(E1, R1, Stacktrace)
             ets:delete(Results),
-            lager:error("Select query terminated due to ~p ~p, stacktrace: ~p", [E1, R1, erlang:get_stacktrace()]),
+            lager:error("Select query terminated due to ~p ~p, stacktrace: ~p", [E1, R1, Stacktrace]),
             exit({E1, R1})
     end,
     case is_integer(Limit) of
@@ -229,6 +241,25 @@ select(Fields, From, Where, OrderBy, Limit, RowQueryTimeout) ->
             end
     end,
     {ok, {select, Results}}.
+
+%% A dnf_hint is a where clause converted to disjunctive normal form.
+%% The format is [map(),map(), ...] where each inner map is a set of
+%% AND predicates. Currently we only convert simple where clauses
+%% containing only AND predicates (which is basically already a DNF).
+dnf_hint(Where) ->
+    dnf_hint(Where, []).
+
+dnf_hint([], Acc) ->
+    %% As the rest of the hint code only ever can return one clause of
+    %% a DNF we need to pack it into a list so it has the form
+    %% [map(), map(),...].
+    [maps:from_list(Acc)];
+dnf_hint([{op,LH,Op,RH}|Rest], Acc) ->
+    dnf_hint(Rest, [{{LH,Op},RH}|Acc]);
+dnf_hint([{'and',{op,LH,Op,RH}}|Rest], Acc) ->
+    dnf_hint(Rest, [{{LH,Op},RH}|Acc]);
+dnf_hint(_,_) ->
+    [].
 
 get_row_initializer(FieldConfig, RequiredFields) ->
     DependsWithDuplicates =
@@ -281,9 +312,9 @@ spawn_initialize_row(CallerRef, CallerPid, RowInitializer, InitRow) ->
     try
         CallerPid ! {CallerRef, {ok, initialize_row(RowInitializer, InitRow)}}
     catch
-        C:E ->
+        ?WITH_STACKTRACE(C, E, Stacktrace)
             lager:warning("Subquery failed. ~nStacktrace:~s",
-                          [lager:pr_stacktrace(erlang:get_stacktrace(), {C,E})]),
+                          [lager:pr_stacktrace(Stacktrace, {C,E})]),
             CallerPid ! {CallerRef, {error, E}}
     end.
 
@@ -366,12 +397,6 @@ eval_query([{'or', Ops}|Rest], false) when is_list(Ops) ->
 eval_query([{'and', _}|_], false) -> false; % Always false
 eval_query([{'or', _}|_], true) -> true. % Always true
 
-eval_op(equals, V1, V2) -> v(V1) == v(V2);
-eval_op(not_equals, V1, V2) -> v(V1) /= v(V2);
-eval_op(lesser, V1, V2) -> v(V1) < v(V2);
-eval_op(lesser_equals, V1, V2) -> v(V1) =< v(V2);
-eval_op(greater, V1, V2) -> v(V1) > v(V2);
-eval_op(greater_equals, V1, V2) -> v(V1) >= v(V2);
 eval_op(match, V, V) -> true;
 eval_op(match, V1, V2) ->
     case {v(V1), v(V2)} of
@@ -392,7 +417,27 @@ eval_op(match, V1, V2) ->
             end;
         _ ->
             false
-    end.
+    end;
+eval_op(Op, V1, V2) ->
+    eval_op_norm(Op, v(V1), v(V2)).
+
+eval_op_norm(Op, V1, V2) when is_atom(V1), is_binary(V2) ->
+    eval_op_(Op, atom_to_binary(V1, utf8), V2);
+eval_op_norm(Op, V1, V2) when is_binary(V1), is_atom(V2) ->
+    eval_op_(Op, V1, atom_to_binary(V2, utf8));
+eval_op_norm(Op, V1, V2) when is_list(V1), is_binary(V2) ->
+    eval_op_(Op, list_to_binary(V1), V2);
+eval_op_norm(Op, V1, V2) when is_binary(V1), is_list(V2) ->
+    eval_op_(Op, V1, list_to_binary(V2));
+eval_op_norm(Op, V1, V2) ->
+    eval_op_(Op, V1, V2).
+
+eval_op_(equals, V1, V2) -> V1 == V2;
+eval_op_(not_equals, V1, V2) -> V1 /= V2;
+eval_op_(lesser, V1, V2) -> V1 < V2;
+eval_op_(lesser_equals, V1, V2) -> V1 =< V2;
+eval_op_(greater, V1, V2) -> V1 > V2;
+eval_op_(greater_equals, V1, V2) -> V1 >= V2.
 
 v(true) -> true;
 v(false) -> false;
@@ -405,12 +450,7 @@ v(<<"<", _/binary>> = MaybePid) ->
     catch
         _:_ -> MaybePid
     end;
-v(V) ->
-    try
-        binary_to_existing_atom(V, utf8)
-    catch
-        _:_ -> V
-    end.
+v(V) -> V.
 
 lookup_ident(Ident) ->
     Row = get({?MODULE, row_data}),

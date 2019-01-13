@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 -export([command/1,
          command/2,
          register_cli/0]).
+
+-include("vmq_metrics.hrl").
 
 -behaviour(clique_handler).
 
@@ -83,7 +85,7 @@ register_cli_usage() ->
 
 
     clique:register_usage(["vmq-admin", "metrics"], metrics_usage()),
-    clique:register_usage(["vmq-admin", "metrics", "show"], metrics_show_usage()),
+    clique:register_usage(["vmq-admin", "metrics", "show"], fun metrics_show_usage/0),
 
     clique:register_usage(["vmq-admin", "api-key"], api_usage()),
     clique:register_usage(["vmq-admin", "api-key", "delete"], api_delete_key_usage()),
@@ -121,41 +123,74 @@ vmq_server_show_cmd() ->
 
 vmq_server_metrics_cmd() ->
     Cmd = ["vmq-admin", "metrics", "show"],
-    FlagSpecs = [{describe, [{shortname, "d"},
-                             {longname, "with-descriptions"}]}],
-    Callback = fun(_, _, Flags) ->
-                       Normalize = fun({T,M,V}) ->
-                                           {T,M,V,undefined};
-                                      ({T,M,V,D}) ->
-                                           {T,M,V,D}
-                                    end,
-                       Describe = lists:keymember(describe, 1, Flags),
-                       lists:foldl(
-                         fun(M, Acc) ->
-                                 {Type, Metric, Val, Description} = Normalize(M),
-                                 SType = atom_to_list(Type),
-                                 SMetric = atom_to_list(Metric),
-                                 SVal =
-                                     case Val of
-                                         V when is_integer(V) ->
-                                             integer_to_list(V);
-                                         V when is_float(V) ->
-                                             float_to_list(V)
-                                     end,
-                                 Line = [SType, ".", SMetric, " = ", SVal],
-                                 case Describe of 
-                                     true ->
-                                         [clique_status:text(lists:flatten(["# ", Description])),
-                                          clique_status:text(lists:flatten([Line, "\n"]))|Acc];
-                                     false ->
-                                         [clique_status:text(lists:flatten(Line))|Acc]
-                                 end
-                         end,
-                         [],
-                         vmq_metrics:metrics(Describe))
-               end,
+    ValidLabels = vmq_metrics:get_label_info(),
+    LabelFlagSpecs =
+        [{I, [{longname, atom_to_list(I)}]} || {I, _} <- ValidLabels],
+    FixedFlagSpecs =
+        [{describe, [{shortname, "d"},
+                     {longname, "with-descriptions"}]},
+         {aggregate, [{shortname, "a"},
+                      {longname, "aggregate"},
+                      {typecast, fun("true") -> true;
+                                    (_) -> false
+                                 end}]}],
+    FlagSpecs = FixedFlagSpecs ++ LabelFlagSpecs,
+    Callback =
+        fun(_, _, Flags) ->
+                Describe = lists:keymember(describe, 1, Flags),
+                Aggregate = case proplists:get_value(aggregate, Flags, true) of
+                                undefined -> true;
+                                Val -> Val
+                            end,
+                LabelFlags = get_label_flags(Flags, LabelFlagSpecs),
+                TextLines =
+                lists:foldl(
+                  fun({#metric_def{type = Type,
+                                   labels = _Labels,
+                                   name = Metric,
+                                   description = Description}, Val}, Acc) ->
+                          SType = atom_to_list(Type),
+                          SMetric = atom_to_list(Metric),
+                          Lines =
+                              case Val of
+                                  V when is_number(V) ->
+                                      [SType, ".", SMetric, " = ", number_to_list(V)];
+                                  {Count, Sum, Buckets} when is_map(Buckets) ->
+                                      HistogramLines =
+                                      [
+                                       [SType, ".", SMetric, "_count = ", number_to_list(Count), "\n"],
+                                       [SType, ".", SMetric, "_sum = ", number_to_list(Sum), "\n"]
+                                      ],
+
+                                      maps:fold(
+                                        fun
+                                            (Bucket, BucketCnt, HistAcc) ->
+                                                [[SType, ".", SMetric, "_bucket_",
+                                                  case Bucket of
+                                                      infinity -> "infinity";
+                                                      _ -> number_to_list(Bucket)
+                                                  end ," = ", number_to_list(BucketCnt), "\n"]  | HistAcc]
+                                        end, HistogramLines, Buckets)
+                              end,
+                          case Describe of
+                              true ->
+                                  ["# ", Description, "\n", Lines,"\n\n"| Acc];
+                              false ->
+                                  [Lines, "\n" | Acc]
+                          end
+                  end,
+                  [],
+                  vmq_metrics:metrics(#{labels => LabelFlags,
+                                        aggregate => Aggregate})),
+                [clique_status:text(lists:flatten(TextLines))]
+        end,
     clique:register_command(Cmd, [], FlagSpecs, Callback).
 
+get_label_flags(Flags, LabelFlagSpecs) ->
+    lists:filter(
+      fun({FlagName, _Val}) ->
+              lists:keymember(FlagName, 1, LabelFlagSpecs)
+      end, Flags).
 
 vmq_server_metrics_reset_cmd() ->
     Cmd = ["vmq-admin", "metrics", "reset"],
@@ -164,8 +199,6 @@ vmq_server_metrics_reset_cmd() ->
                        [clique_status:text("Done")]
                end,
     clique:register_command(Cmd, [], [], Callback).
-
-
 
 vmq_cluster_leave_cmd() ->
     %% is must be ensured that the leaving node has NO online session e.g. by
@@ -207,9 +240,10 @@ vmq_cluster_leave_cmd() ->
                        IsKill = lists:keymember(kill, 1, Flags),
                        Interval = proplists:get_value(summary_interval, Flags, 5000),
                        Timeout = proplists:get_value(timeout, Flags, 60000),
-                       N = Timeout div Interval,
-                       {ok, Local} = plumtree_peer_service_manager:get_local_state(),
-                       TargetNodes = riak_dt_orswot:value(Local) -- [Node],
+                       %% Make sure Iterations > 0 to it will be
+                       %% checked at least once if queue migration is complete.
+                       Iterations = max(Timeout div Interval, 1),
+                       TargetNodes = vmq_peer_service:members() -- [Node],
                        Text =
                        case net_adm:ping(Node) of
                            pang ->
@@ -224,6 +258,8 @@ vmq_cluster_leave_cmd() ->
                                        "Can't fix queues because cluster is inconsistent, retry!"
                                end;
                            pong when IsKill ->
+                               Caller = self(),
+                               CRef = make_ref(),
                                LeaveFun =
                                fun() ->
                                        %% stop all MQTT sessions on Node
@@ -233,7 +269,7 @@ vmq_cluster_leave_cmd() ->
                                        %% At this point, client reconnect and will drain
                                        %% their queues located at 'Node' migrating them to
                                        %% their new node.
-                                       case wait_till_all_offline(Interval, N) of
+                                       case wait_till_all_offline(Interval, Iterations) of
                                            ok ->
                                                %% There is no guarantee that all clients will
                                                %% reconnect on time; we've to force migrate all
@@ -242,10 +278,11 @@ vmq_cluster_leave_cmd() ->
                                                %% node is online, we'll go the proper route
                                                %% instead of calling leave_cluster('Node')
                                                %% directly
-                                               _ = plumtree_peer_service:leave(unused_arg),
+                                               _ = vmq_peer_service:leave(Node),
+                                               Caller ! {done, CRef},
                                                init:stop();
                                            error ->
-                                               exit("error, still online queues, check the logs, and retry!")
+                                               Caller ! {msg, CRef, "error, still online queues, check the logs, and retry!"}
                                        end
                                end,
                                ProcName = {?MODULE, vmq_server_migration},
@@ -256,10 +293,12 @@ vmq_cluster_leave_cmd() ->
                                                Pid = spawn(Node, LeaveFun),
                                                MRef = monitor(process, Pid),
                                                receive
-                                                   {'DOWN', MRef, process, Pid, normal} ->
+                                                   {msg, CRef, Msg} ->
+                                                       Msg;
+                                                   {done, CRef} ->
                                                        "Done";
                                                    {'DOWN', MRef, process, Pid, Reason} ->
-                                                       Reason
+                                                       "Unknown error: " ++ atom_to_list(Reason)
                                                end;
                                            false ->
                                                "Can't migrate queues because cluster is inconsistent, retry!"
@@ -277,23 +316,12 @@ vmq_cluster_leave_cmd() ->
                end,
     clique:register_command(Cmd, KeySpecs, FlagSpecs, Callback).
 
-
 leave_cluster(Node) ->
-    {ok, Local} = plumtree_peer_service_manager:get_local_state(),
-    {ok, Actor} = plumtree_peer_service_manager:get_actor(),
-    case riak_dt_orswot:update({remove, Node}, Actor, Local) of
-        {error,{precondition,{not_present, Node}}} ->
-            io_lib:format("Node ~p wasn't part of the cluster~n", [Node]);
-        {ok, Merged} ->
-            _ = gen_server:cast(plumtree_peer_service_gossip, {receive_state, Merged}),
-            {ok, Local2} = plumtree_peer_service_manager:get_local_state(),
-            Local2List = riak_dt_orswot:value(Local2),
-            case [P || P <- Local2List, P =:= Node] of
-                [] ->
-                    "Done";
-                _ ->
-                    leave_cluster(Node)
-            end
+    case vmq_peer_service:leave(Node) of
+        ok ->
+            "Done";
+        {error, not_present} ->
+            io_lib:format("Node ~p wasn't part of the cluster~n", [Node])
     end.
 
 check_cluster_consistency([Node|Nodes] = All, NrOfRetries) ->
@@ -333,7 +361,7 @@ vmq_cluster_join_cmd() ->
                        Text = clique_status:text("You have to provide a discovery node (example discovery-node=vernemq1@127.0.0.1)"),
                        [clique_status:alert([Text])];
                    (_, [{'discovery-node', Node}], _) ->
-                       case plumtree_peer_service:join(Node) of
+                       case vmq_peer_service:join(Node) of
                            ok ->
                                vmq_cluster:recheck(),
                                [clique_status:text("Done")];
@@ -454,7 +482,7 @@ join_usage() ->
 
 leave_usage() ->
     ["vmq-admin cluster leave node=<Node> [-k | --kill_sessions]\n\n",
-     "  Graceful cluster-leave and shudown of a cluster node. \n\n",
+     "  Graceful cluster-leave and shutdown of a cluster node. \n\n",
      "  If <Node> is already offline its cluster membership gets removed,\n",
      "  and the queues of the subscribers that have been connected at shutdown\n",
      "  will be recreated on other cluster nodes. This might involve\n",
@@ -462,7 +490,7 @@ leave_usage() ->
      "  \n",
      "  If <Node> is still online all its MQTT listeners (including websockets)\n",
      "  are stopped and wont therefore accept new connections. Established\n",
-     "  connections aren't canceled at this point. Use --kill_sessions to get\n",
+     "  connections aren't cancelled at this point. Use --kill_sessions to get\n",
      "  into the second phase of the graceful shutdown.\n",
      "  \n",
      "   --kill_sessions, -k,\n",
@@ -472,7 +500,7 @@ leave_usage() ->
      "       logs the status of an ongoing migration every <IntervalInSecs>\n",
      "       seconds, defaults to 5 seconds.\n",
      "   --timeout=<TimeoutInSecs>, -t\n",
-     "       stops the migration process afer <TimeoutInSecs> seconds, defaults\n",
+     "       stops the migration process after <TimeoutInSecs> seconds, defaults\n",
      "       to 60 seconds. The command can be reissued in case of a timeout.",
      "\n\n"
     ].
@@ -532,11 +560,22 @@ metrics_usage() ->
     ].
 
 metrics_show_usage() ->
+    Labels =
+        [io_lib:format("      --~p=[~s]\n", [Key,  string:join(Values, "|")])
+         || {Key, Values}  <- vmq_metrics:get_label_info()],
     ["vmq-admin metrics show\n\n",
-     "  Prints all available metrics for this VerneMQ node.\n\n",
+     "  Show and filter metrics for this VerneMQ node.\n\n",
      "Options\n\n",
      "  --with-descriptions, -d,\n"
-     "    Show metrics annotated with descriptions.\n"
+     "    Show metrics annotated with descriptions.\n\n"
+     "Labels\n\n"
+     "    Filter metrics by labels. Accepts multiple comma separated labels.\n"
+     "    If no labels are applied all metrics are shown.\n"
+     "    Metrics are shown if any of the listed labels match,\n\n"
+     "    Available labels and values (--labelname=[val1|val2|...]):\n"
+     | [Labels
+     |
+     "\n    Example: --mqtt_version=4\n\n"]
     ].
 
 api_usage() ->
@@ -586,3 +625,6 @@ ensure_all_stopped([], Res) -> Res.
 
 remove_ok({ok, Res}) ->
     Res.
+
+number_to_list(N) when is_integer(N) -> integer_to_list(N);
+number_to_list(N) when is_float(N) -> float_to_list(N).

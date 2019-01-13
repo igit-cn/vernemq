@@ -1,4 +1,4 @@
-%% Copyright 2017 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@
           terminate_fun = undefined,
 
           %% The worker PID if running.
-          worker = undefined :: {reference(), pid()},
+          worker = undefined :: undefined | {reference(), pid()},
 
           %% Is the client process ready?
           connected = false :: boolean(),
@@ -196,7 +196,7 @@ handle_info(_, S) ->
 %% @end
 %%--------------------------------------------------------------------
 terminate(_Reason, #state{terminate_fun=TFun, worker={_Mref, Pid}})
-  when TFun =:= undefined ->
+  when TFun =/= undefined ->
     TFun(Pid),
     ok;
 terminate(_Reason, _State) ->

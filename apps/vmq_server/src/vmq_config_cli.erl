@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -49,7 +49,15 @@ register_config_() ->
      "graphite_host",
      "graphite_port",
      "graphite_interval",
-     "shared_subscription_policy"
+     "graphite_include_labels",
+     "shared_subscription_policy",
+     "remote_enqueue_timeout",
+     "topic_alias_max_client",
+     "topic_alias_max_broker",
+     "max_last_will_delay",
+     "receive_max_client",
+     "receive_max_broker",
+     "suppress_lwt_on_session_takeover"
     ],
     _ = [clique:register_config([Key], fun register_config_callback/3)
          || Key <- ConfigKeys],

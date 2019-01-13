@@ -36,11 +36,11 @@
 %% ------------------------------------------------------------------------
 
 -export([new/1,
-		 match/2,
+         match/2,
          validate_topic/2,
          contains_wildcard/1,
          unword/1,
-		 triples/1]).
+         triples/1]).
 
 -define(MAX_LEN, 65536).
 
@@ -76,21 +76,8 @@ triples([Word], Acc) ->
 triples([Word|Rest] = Topic, Acc) ->
     triples(Rest, [{reverse(Rest), Word, reverse(Topic)}|Acc]).
 
-unword([Word|_] = Topic) when is_binary(Word) ->
-    reverse(unword(Topic, []));
-unword(Topic) when is_binary(Topic) ->
-    Topic;
-unword(undefined) -> undefined;
-unword(empty) -> empty.
-
-unword([<<>>], []) -> [$/];
-unword([<<>>], Acc) -> Acc;
-unword([], Acc) -> [$/|Acc];
-unword([Word], Acc) -> [Word|Acc];
-unword([<<>>|Topic], Acc) ->
-    unword(Topic, [$/|Acc]);
-unword([Word|Rest], Acc) ->
-    unword(Rest, [$/, Word|Acc]).
+unword(Topic) ->
+    vernemq_dev_api:unword_topic(Topic).
 
 validate_topic(_Type, <<>>) ->
     {error, no_empty_topic_allowed};
@@ -125,14 +112,14 @@ validate_publish_topic(Topic, L, Acc) ->
     end.
 
 validate_subscribe_topic(<<"+/", Rest/binary>>, _, Acc) -> validate_subscribe_topic(Rest, 0, [<<"+">>|Acc]);
-validate_subscribe_topic(<<"+">>, _, Acc) -> {ok, reverse([<<"+">>|Acc])};
-validate_subscribe_topic(<<"#">>, _, Acc) -> {ok, reverse([<<"#">>|Acc])};
+validate_subscribe_topic(<<"+">>, _, Acc) -> validate_shared_subscription(reverse([<<"+">>|Acc]));
+validate_subscribe_topic(<<"#">>, _, Acc) -> validate_shared_subscription(reverse([<<"#">>|Acc]));
 validate_subscribe_topic(Topic, L, Acc) ->
     case Topic of
         <<Word:L/binary, "/", Rest/binary>> ->
             validate_subscribe_topic(Rest, 0, [Word|Acc]);
         <<Word:L/binary>> ->
-            {ok, lists:reverse([Word|Acc])};
+            validate_shared_subscription(reverse([Word|Acc]));
         <<_:L/binary, "+", _/binary>> ->
             {error, 'no_+_allowed_in_word'};
         <<_:L/binary, "#", _/binary>> ->
@@ -140,6 +127,10 @@ validate_subscribe_topic(Topic, L, Acc) ->
         _ ->
             validate_subscribe_topic(Topic, L + 1, Acc)
     end.
+
+validate_shared_subscription([<<"$share">>, _Group, _FirstWord | _] = Topic) -> {ok, Topic};
+validate_shared_subscription([<<"$share">> | _] = _Topic) -> {error, invalid_shared_subscription};
+validate_shared_subscription(Topic) -> {ok, Topic}.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -209,9 +200,12 @@ validate_wildcard_test() ->
     {error, 'no_+_allowed_in_word'} = validate_topic(subscribe, <<"/test/+testtopic">>),
     {error, 'no_+_allowed_in_word'} = validate_topic(subscribe, <<"/testtesttopic+">>).
 
+validate_shared_subscription_test() ->
+    {error, invalid_shared_subscription} = validate_topic(subscribe, <<"$share/mygroup">>),
+    {ok, [<<"$share">>, <<"mygroup">>, <<"a">>, <<"b">>]} = validate_topic(subscribe, <<"$share/mygroup/a/b">>).
+
 validate_unword_test() ->
-    {A,B,C} = now(),
-    random:seed(A, B, C),
+    rand:seed(exsplus, erlang:timestamp()),
     random_topics(1000),
     ok.
 
@@ -222,10 +216,10 @@ contains_wildcard_test() ->
 
 random_topics(0) -> ok;
 random_topics(N) when N > 0 ->
-    NWords = random:uniform(100),
+    NWords = rand:uniform(100),
     Words =
     lists:foldl(fun(_, AAcc) ->
-                    case random:uniform(3) of
+                    case rand:uniform(3) of
                         1 ->
                             ["+/"|AAcc];
                         _ ->
@@ -239,8 +233,8 @@ random_topics(N) when N > 0 ->
 
 random_word() ->
     Words = "abcdefghijklmnopqrstuvwxyz0123456789",
-    N = random:uniform(length(Words)),
-    S = random:uniform(length(Words) + 1 - N),
+    N = rand:uniform(length(Words)),
+    S = rand:uniform(length(Words) + 1 - N),
     string:substr(Words, N, S).
 
 -endif.

@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,12 +21,14 @@
          delete/1,
          subscribe_db_events/0]).
 
+-import(vmq_subscriber, [check_format/1]).
+
 -define(SUBSCRIBER_DB, {vmq, subscriber}).
 -define(TOMBSTONE, '$deleted').
 
 -spec store(subscriber_id(), vmq_subscriber:subs()) -> ok.
 store(SubscriberId, Subs) ->
-    plumtree_metadata:put(?SUBSCRIBER_DB, SubscriberId, Subs).
+    vmq_metadata:put(?SUBSCRIBER_DB, SubscriberId, Subs).
 
 -spec read(subscriber_id()) -> undefined |vmq_subscriber:subs().
 read(SubscriberId) ->
@@ -34,40 +36,36 @@ read(SubscriberId) ->
 
 -spec read(subscriber_id(), any()) -> any() |vmq_subscriber:subs().
 read(SubscriberId, Default) ->
-    case plumtree_metadata:get(?SUBSCRIBER_DB, SubscriberId) of
+    case vmq_metadata:get(?SUBSCRIBER_DB, SubscriberId) of
         undefined -> Default;
         Subs ->
-            vmq_subscriber:check_format(Subs)
+            check_format(Subs)
     end.
 
 -spec delete(subscriber_id()) -> ok.
 delete(SubscriberId) ->
-    plumtree_metadata:delete(?SUBSCRIBER_DB, SubscriberId).
+    vmq_metadata:delete(?SUBSCRIBER_DB, SubscriberId).
 
 fold(FoldFun, Acc) ->
-    plumtree_metadata:fold(
+    vmq_metadata:fold(?SUBSCRIBER_DB,
       fun ({_, ?TOMBSTONE}, AccAcc) -> AccAcc;
           ({SubscriberId, Subs}, AccAcc) ->
-              FoldFun({SubscriberId, vmq_subscriber:check_format(Subs)}, AccAcc)
-      end, Acc, ?SUBSCRIBER_DB,
-      [{resolver, lww}]).
+              FoldFun({SubscriberId, check_format(Subs)}, AccAcc)
+      end, Acc).
 
 subscribe_db_events() ->
-    plumtree_metadata_manager:subscribe(?SUBSCRIBER_DB),
+    vmq_metadata:subscribe(?SUBSCRIBER_DB),
     fun
         ({deleted, ?SUBSCRIBER_DB, _, Val})
           when (Val == ?TOMBSTONE) or (Val == undefined) ->
             ignore;
         ({deleted, ?SUBSCRIBER_DB, SubscriberId, Subscriptions}) ->
-            Deleted = vmq_subscriber:get_changes(Subscriptions),
-            {delete, SubscriberId, Deleted};
+            {delete, SubscriberId, check_format(Subscriptions)};
         ({updated, ?SUBSCRIBER_DB, SubscriberId, OldVal, NewSubs})
           when (OldVal == ?TOMBSTONE) or (OldVal == undefined) ->
-            Added = vmq_subscriber:get_changes(NewSubs),
-            {update, SubscriberId, [], Added};
+            {update, SubscriberId, [], check_format(NewSubs)};
         ({updated, ?SUBSCRIBER_DB, SubscriberId, OldSubs, NewSubs}) ->
-            {Removed, Added} = vmq_subscriber:get_changes(OldSubs, NewSubs),
-            {update, SubscriberId, Removed, Added};
+            {update, SubscriberId, check_format(OldSubs), check_format(NewSubs)};
         (_) ->
             ignore
     end.

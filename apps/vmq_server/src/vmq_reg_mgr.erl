@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
 %% limitations under the License.
 
 -module(vmq_reg_mgr).
+
+-include("vmq_server.hrl").
 
 -behaviour(gen_server).
 %% API functions
@@ -150,25 +152,24 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-setup_queue(SubscriberId, Nodes, Acc) ->
-    case lists:member(node(), Nodes) of
-        true ->
-            vmq_queue_sup_sup:start_queue(SubscriberId);
-        false ->
+setup_queue(SubscriberId, Subs, Acc) ->
+    case lists:keyfind(node(), 1, Subs) of
+        {_Node, false, _Subs} ->
+            vmq_queue_sup_sup:start_queue(SubscriberId, false);
+        _ ->
             Acc
     end.
 
 handle_event(Handler, Event) ->
     case Handler(Event) of
-        {delete, _, _} ->
+        {delete, _SubscriberId, _} ->
             %% TODO: we might consider a queue cleanup here.
             ignore;
         {update, _SubscriberId, [], []} ->
             %% noop
             ignore;
-        {update, SubscriberId, _, _} ->
-            Subs = vmq_reg:subscriptions_for_subscriber_id(SubscriberId),
-            handle_new_sub_event(SubscriberId, Subs);
+        {update, SubscriberId, _OldSubs, NewSubs} ->
+            handle_new_sub_event(SubscriberId, NewSubs);
         ignore ->
             ignore
     end.
@@ -209,7 +210,7 @@ handle_new_remote_subscriber(SubscriberId, QPid, [{NewNode, false}]) ->
     migrate_queue(SubscriberId, QPid, NewNode);
 handle_new_remote_subscriber(SubscriberId, QPid, [{_NewNode, true}]) ->
     %% New remote queue uses clean_session=true, we have to wipe this local session
-    cleanup_queue(SubscriberId, QPid);
+    cleanup_queue(SubscriberId, ?SESSION_TAKEN_OVER, QPid);
 handle_new_remote_subscriber(SubscriberId, QPid, Sessions) ->
     % Case Not 3.
     %% Do we have available remote sessions
@@ -235,10 +236,10 @@ migrate_queue(SubscriberId, QPid, Node) ->
                               end
                       end, Node, 60000).
 
-cleanup_queue(SubscriberId, QPid) ->
+cleanup_queue(SubscriberId, Reason, QPid) ->
     vmq_reg_sync:async({cleanup, SubscriberId},
                        fun() ->
-                               vmq_queue:cleanup(QPid)
+                               vmq_queue:cleanup(QPid, Reason)
                        end, node(), 60000).
 
 is_allow_multi(QPid) ->

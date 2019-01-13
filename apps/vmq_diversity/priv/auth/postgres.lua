@@ -1,4 +1,4 @@
--- Copyright 2017 Erlio GmbH Basel Switzerland (http://erl.io)
+-- Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -110,5 +110,9 @@ hooks = {
     auth_on_subscribe = auth_on_subscribe,
     on_unsubscribe = on_unsubscribe,
     on_client_gone = on_client_gone,
-    on_client_offline = on_client_offline
+    on_client_offline = on_client_offline,
+
+    auth_on_register_m5 = auth_on_register_m5,
+    auth_on_publish_m5 = auth_on_publish_m5,
+    auth_on_subscribe_m5 = auth_on_subscribe_m5,
 }

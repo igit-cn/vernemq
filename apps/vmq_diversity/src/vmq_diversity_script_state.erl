@@ -1,4 +1,4 @@
-%% Copyright 2017 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -179,6 +179,7 @@ handle_info({call_function, Ref, CallerPid, Function, Args}, State) ->
     CallerPid ! {call_function_response, Ref, Reply},
     {noreply, NewState}.
 
+
 %%--------------------------------------------------------------------
 %% @private
 %% @doc
@@ -225,7 +226,8 @@ load_script(Id, Script) ->
             {vmq_diversity_ets,         <<"kv">>},
             {vmq_diversity_lager,       <<"log">>},
             {vmq_diversity_memcached,   <<"memcached">>},
-            {vmq_diversity_cache,       <<"auth_cache">>}
+            {vmq_diversity_cache,       <<"auth_cache">>},
+            {vmq_diversity_vmq_api,     <<"vmq_api">>}
            ],
 
     {ok, ScriptsDir} = application:get_env(vmq_diversity, script_dir),

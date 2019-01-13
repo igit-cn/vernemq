@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -25,8 +25,8 @@
 
 -spec start(_, _) -> {'error', _} | {'ok', pid()} | {'ok', pid(), _}.
 start(_StartType, _StartArgs) ->
-    {ok, rnd} = rand_compat:init(),
-    vmq_server_cli:init_registry(),
+    ok = vmq_metadata:start(),
+
     case vmq_server_sup:start_link() of
         {error, _} = E ->
             E;
@@ -36,6 +36,7 @@ start(_StartType, _StartArgs) ->
             %% vmq_plugin_mgr waits for the 'vmq_server_sup' process
             %% to be registered.
             timer:sleep(500),
+            vmq_server_cli:init_registry(),
             start_user_plugins(),
             vmq_config:configure_node(),
             R
@@ -51,7 +52,7 @@ start_user_plugin({_Order, #{path := Path,
               undefined ->
                   vmq_plugin_mgr:enable_plugin(PluginName);
               _ ->
-                  vmq_plugin_mgr:enable_plugin(PluginName, [Path])
+                  vmq_plugin_mgr:enable_plugin(PluginName, [{path, Path}])
           end,
     case Res of
         ok ->
@@ -62,4 +63,5 @@ start_user_plugin({_Order, #{path := Path,
 
 -spec stop(_) -> 'ok'.
 stop(_State) ->
+    _ = vmq_metadata:stop(),
     ok.

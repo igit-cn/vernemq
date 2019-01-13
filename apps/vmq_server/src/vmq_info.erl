@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 -include_lib("vmq_ql/include/vmq_ql.hrl").
 
 -export([fields_config/0,
-         fold_init_rows/3]).
+         fold_init_rows/4]).
 
 %% used by vmq_info_cli
 -export([session_info_items/0]).
@@ -34,8 +34,7 @@ fields_config() ->
     Queues = #vmq_ql_table{
                    name =       queues,
                    depends_on = [QueueBase],
-                   provides = [deliver_mode,
-                               queue_size,
+                   provides = [queue_size,
                                session_pid,
                                is_offline,
                                is_online,
@@ -63,7 +62,7 @@ fields_config() ->
     Subscriptions = #vmq_ql_table{
                     name =      subscriptions,
                     depends_on = [QueueBase],
-                    provides = [topic, qos],
+                    provides = [topic, qos, rap, no_local],
                     init_fun = fun subscription_row_init/1,
                     include_if_all = false
                     },
@@ -89,10 +88,24 @@ session_info_items() ->
     %% used in vmq_info_cli
     lists:flatten([Fields || #vmq_ql_table{provides=Fields} <- fields_config()]).
 
-fold_init_rows(_, Fun, Acc) ->
+%% For now we only optimize the exact case with the predicates in a
+%% specific order (MP,ClientID).
+fold_init_rows(_, Fun, Acc, [#{{mountpoint,equals} := MP,
+                               {client_id,equals} := ClientId}]) ->
+    case vmq_queue_sup_sup:get_queue_pid({binary_to_list(MP), ClientId}) of
+        not_found -> [];
+        QPid ->
+            InitRow = #{node => atom_to_binary(node(),utf8),
+                        mountpoint => MP,
+                        '__mountpoint' => MP,
+                        client_id => ClientId,
+                        queue_pid => QPid},
+            [Fun(InitRow, Acc)]
+    end;
+fold_init_rows(_, Fun, Acc,_) ->
     vmq_queue_sup_sup:fold_queues(
       fun({MP, ClientId}, QPid, AccAcc) ->
-              InitRow = #{node => node(),
+              InitRow = #{node => atom_to_binary(node(),utf8),
                           mountpoint => list_to_binary(MP),
                           '__mountpoint' => MP,
                           client_id => ClientId,
@@ -124,21 +137,34 @@ session_row_init(Row) ->
         error ->
             [Row];
         {ok, SessionPid} ->
-            {ok, InfoItems} = vmq_mqtt_fsm:info(SessionPid, [user,
-                                                             peer_host,
-                                                             peer_port,
-                                                             protocol,
-                                                             waiting_acks]),
-            [maps:merge(Row, maps:from_list(InfoItems))]
+            case vmq_mqtt_fsm:info(SessionPid, [user,
+                                                peer_host,
+                                                peer_port,
+                                                protocol,
+                                                waiting_acks]) of
+                {ok, InfoItems} ->
+                    [maps:merge(Row, maps:from_list(InfoItems))];
+                {error, i_am_a_plugin} ->
+                    [Row]
+            end
     end.
 
 subscription_row_init(Row) ->
     SubscriberId = {maps:get('__mountpoint', Row), maps:get(client_id, Row)},
     Subs = vmq_reg:subscriptions_for_subscriber_id(SubscriberId),
-    vmq_subscriber:fold(fun({Topic, QoS, _Node}, Acc) ->
-                                [maps:merge(Row, #{topic => vmq_topic:unword(Topic),
-                                                   qos => QoS})|Acc]
-                        end, [], Subs).
+    vmq_subscriber:fold(
+      fun({Topic, SubInfo, _Node}, Acc) ->
+              {QoS, SubOpts} =
+                  case SubInfo of
+                      {_, _} -> SubInfo;
+                      Q when is_integer(Q) ->
+                          {Q, #{}}
+                  end,
+              M1 = maps:merge(Row, #{topic => iolist_to_binary(vmq_topic:unword(Topic)),
+                                     qos => QoS}),
+              M2 = maps:merge(M1, SubOpts),
+              [M2|Acc]
+      end, [], Subs).
 
 message_ref_row_init(Row) ->
     SubscriberId = {maps:get('__mountpoint', Row), maps:get(client_id, Row)},
@@ -160,7 +186,7 @@ message_row_init(Row) ->
                       dup=Dup, routing_key=RoutingKey,
                       payload=Payload}} ->
             [maps:merge(Row, #{msg_qos => QoS,
-                               routing_key => vmq_topic:unword(RoutingKey),
+                               routing_key => iolist_to_binary(vmq_topic:unword(RoutingKey)),
                                dup => Dup,
                                payload => Payload})];
         _ ->

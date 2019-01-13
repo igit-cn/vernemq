@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -59,10 +59,10 @@ call_function(Pid, Function, Args) ->
     %% error in the plugin code can crash session/queue. As the Lua
     %% support should provide a sandboxed environment we saveguard
     %% calls into the Lua environment.
-    case catch gen_server:call(Pid, {call_function, Function, Args}) of
+    case catch gen_server:call(Pid, {call_function, Function, Args}, infinity) of
         {'EXIT', Reason} ->
             lager:error("can't call into Lua sandbox for function ~p due to ~p", [Function, Reason]),
-            error;
+            {error, Reason};
         Ret ->
             Ret
     end.

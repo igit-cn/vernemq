@@ -1,4 +1,4 @@
-%% Copyright 2016 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,27 +21,27 @@
 
 insert(PoolName, Collection, DocOrDocs) ->
     poolboy:transaction(PoolName, fun(Worker) ->
-                                          vmq_diversity_worker_wrapper:apply(Worker, mongo, insert, [Collection, DocOrDocs])
+                                          vmq_diversity_worker_wrapper:apply(Worker, mc_worker_api, insert, [Collection, DocOrDocs])
                                   end).
 
 update(PoolName, Collection, Selector, Command) ->
     poolboy:transaction(PoolName, fun(Worker) ->
-                                          vmq_diversity_worker_wrapper:apply(Worker, mongo, update, [Collection, Selector, Command])
+                                          vmq_diversity_worker_wrapper:apply(Worker, mc_worker_api, update, [Collection, Selector, Command])
                                   end).
 
 delete(PoolName, Collection, Selector) ->
     poolboy:transaction(PoolName, fun(Worker) ->
-                                          vmq_diversity_worker_wrapper:apply(Worker, mongo, delete, [Collection, Selector])
+                                          vmq_diversity_worker_wrapper:apply(Worker, mc_worker_api, delete, [Collection, Selector])
                                   end).
 
 find(PoolName, Collection, Selector, Args) ->
     poolboy:transaction(PoolName, fun(Worker) ->
-                                          vmq_diversity_worker_wrapper:apply(Worker, mongo, find, [Collection, Selector, Args])
+                                          vmq_diversity_worker_wrapper:apply(Worker, mc_worker_api, find, [Collection, Selector, Args])
                                   end).
 
 find_one(PoolName, Collection, Selector, Args) ->
     poolboy:transaction(PoolName, fun(Worker) ->
-                                          vmq_diversity_worker_wrapper:apply(Worker, mongo, find_one, [Collection, Selector, Args])
+                                          vmq_diversity_worker_wrapper:apply(Worker, mc_worker_api, find_one, [Collection, Selector, Args])
                                   end).
 
 install(St) ->
@@ -140,7 +140,7 @@ insert(As, St) ->
                     PoolId = pool_id(BPoolId, As, St),
                     try insert(PoolId, Collection,
                                 check_ids(vmq_diversity_utils:map(TableOrTables))) of
-                        Result1 ->
+                        {{true, _}, Result1} ->
                             {Result2, NewSt} = luerl:encode(
                                                  vmq_diversity_utils:unmap(check_ids(Result1)), St),
                             {[Result2], NewSt}
@@ -166,7 +166,7 @@ update(As, St) ->
                     PoolId = pool_id(BPoolId, As, St),
                     try update(PoolId, Collection, check_ids(vmq_diversity_utils:map(Selector)),
                                #{<<"$set">> => check_ids(vmq_diversity_utils:map(Command))}) of
-                        ok ->
+                        {true,_} ->
                             {[true], St}
                     catch
                         E:R ->
@@ -187,7 +187,7 @@ delete(As, St) ->
                 Selector when is_list(Selector) ->
                     PoolId = pool_id(BPoolId, As, St),
                     try delete(PoolId, Collection, check_ids(vmq_diversity_utils:map(Selector))) of
-                        ok ->
+                        {true, _} ->
                             {[true], St}
                     catch
                         E:R ->
@@ -207,8 +207,8 @@ find(As, St) ->
             case luerl:decode(Selector0, St) of
                 Selector when is_list(Selector) ->
                     PoolId = pool_id(BPoolId, As, St),
-                    try find(PoolId, Collection, check_ids(vmq_diversity_utils:map(Selector)), parse_args(Args, St)) of
-                        CursorPid when is_pid(CursorPid) ->
+                    try find(PoolId, Collection, check_ids(vmq_diversity_utils:map(Selector)), maps:from_list(parse_args(Args, St))) of
+                        {ok, CursorPid} when is_pid(CursorPid) ->
                             %% we re passing the cursor pid as a binary to the Lua Script
                             BinPid = list_to_binary(pid_to_list(CursorPid)),
                             {[<<"mongo-cursor-", BinPid/binary>>], St}
@@ -230,7 +230,7 @@ find_one(As, St) ->
             case luerl:decode(Selector0, St) of
                 Selector when is_list(Selector) ->
                     PoolId = pool_id(BPoolId, As, St),
-                    try find_one(PoolId, Collection, check_ids(vmq_diversity_utils:map(Selector)), parse_args(Args, St)) of
+                    try find_one(PoolId, Collection, check_ids(vmq_diversity_utils:map(Selector)), maps:from_list(parse_args(Args, St))) of
                         Result1 when map_size(Result1) > 0 ->
                             {Result2, NewSt} = luerl:encode(
                                                  vmq_diversity_utils:unmap(check_ids(Result1)), St),
@@ -257,7 +257,7 @@ cursor_next(As, St) ->
                 error ->
                     {[false], St};
                 {Result1} ->
-                    {Result2, NewSt} = luerl:encode(vmq_diversity_utils:unmap(check_ids(Result1)), St),
+                    {Result2, NewSt} = luerl:encode(vmq_diversity_utils:unmap(check_ids({Result1})), St),
                     {[Result2], NewSt}
             end;
         _ ->
@@ -327,7 +327,19 @@ parse_args_([], Acc) -> Acc.
 %% The ObjectId is autogenerated by the MongoDB driver in case
 %% no _id element is given in the document.
 check_ids(Doc) when is_map(Doc) -> check_id(Doc);
-check_ids(Docs) when is_list(Docs) -> check_ids(Docs, []).
+check_ids(Docs) when is_list(Docs) -> check_ids(Docs, []);
+%% Remove the tuple here to fix this dialyzer warning:
+%%
+%% apps/vmq_diversity/src/vmq_diversity_mongo.erl
+%%  260: The call vmq_diversity_mongo:check_ids(Result1::tuple()) will never return since it differs in the 1st argument from the success typing arguments: ([any()] | map())
+%%
+%% I believe this warning is incorrect in that mc_curser:next/1 claims
+%% to return {bson:document()} but really returns a {map()}. See
+%% https://github.com/comtihon/mongodb-erlang/issues/204
+%%
+%% This workaround seem to shut dialyzer up.
+check_ids({Doc}) -> check_ids(Doc).
+
 
 check_ids([], Acc) -> lists:reverse(Acc);
 check_ids([Doc|Rest], Acc) ->

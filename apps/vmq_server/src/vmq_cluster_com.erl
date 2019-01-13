@@ -1,4 +1,4 @@
-%% Copyright 2014 Erlio GmbH Basel Switzerland (http://erl.io)
+%% Copyright 2018 Erlio GmbH Basel Switzerland (http://erl.io)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,6 +21,9 @@
 
 -export([init/4,
          loop/1]).
+
+%% exported for testing
+-export([to_vmq_msg/1]).
 
 -record(st, {socket,
              buffer= <<>>,
@@ -148,16 +151,9 @@ process_bytes(Bytes, Buffer, St) ->
     end.
 
 process(<<"msg", L:32, Bin:L/binary, Rest/binary>>, St) ->
-    case binary_to_term(Bin) of
-        #vmq_msg{mountpoint=MP,
-                 routing_key=Topic} = Msg ->
-            _ = vmq_reg_view:fold(St#st.reg_view, MP, Topic, fun publish/2, {Msg, undefined});
-        CompatMsg ->
-            SGPolicy = vmq_config:get_env(shared_subscription_policy, prefer_local),
-            #vmq_msg{mountpoint=MP,
-                     routing_key=Topic} = Msg = compat_msg(CompatMsg, SGPolicy),
-            _ = vmq_reg_view:fold(St#st.reg_view, MP, Topic, fun publish/2, {Msg, undefined})
-    end,
+    #vmq_msg{mountpoint=MP,
+             routing_key=Topic} = Msg = to_vmq_msg(binary_to_term(Bin)),
+    _ = vmq_reg_view:fold(St#st.reg_view, {MP, ?INTERNAL_CLIENT_ID}, Topic, fun publish/3, {Msg, undefined}),
     process(Rest, St);
 process(<<"enq", L:32, Bin:L/binary, Rest/binary>>, St) ->
     case binary_to_term(Bin) of
@@ -167,9 +163,7 @@ process(<<"enq", L:32, Bin:L/binary, Rest/binary>>, St) ->
             %% the cluster communication.
             spawn(fun() ->
                           try
-                              SGPolicy = vmq_config:get_env(shared_subscription_policy, prefer_local),
-                              CompatMsgs = compat_msgs(Msgs, SGPolicy),
-                              Reply = vmq_queue:enqueue_many(QueuePid, CompatMsgs),
+                              Reply = vmq_queue:enqueue_many(QueuePid, to_vmq_msgs(Msgs)),
                               CallerPid ! {Ref, Reply}
                           catch
                               _:_ ->
@@ -184,9 +178,7 @@ process(<<"enq", L:32, Bin:L/binary, Rest/binary>>, St) ->
                           try
                               case vmq_queue_sup_sup:get_queue_pid(SubscriberId) of
                                   QueuePid when is_pid(QueuePid) ->
-                                      SGPolicy = vmq_config:get_env(shared_subscription_policy, prefer_local),
-                                      CompatMsgs = compat_msgs(Msgs, SGPolicy),
-                                      Reply = vmq_queue:enqueue_many(QueuePid, CompatMsgs, Opts),
+                                      Reply = vmq_queue:enqueue_many(QueuePid, Msgs, Opts),
                                       CallerPid ! {Ref, Reply}
                               end
                           catch
@@ -203,15 +195,26 @@ process(<<Cmd:3/binary, L:32, _:L/binary, Rest/binary>>, St) ->
     lager:warning("unknown message: ~p", [Cmd]),
     process(Rest, St).
 
-compat_msgs(Msgs, SGPolicy) ->
-    lists:map(fun({deliver, Qos, Msg}) ->
-                      {deliver, Qos, compat_msg(Msg, SGPolicy)}
-              end, Msgs).
-    
-%% Convert #vmq_msg{} records coming from pre-subscriber group nodes
-%% owhich don't have the sg_policy member
-compat_msg(#vmq_msg{} = Msg, _) -> Msg;
-compat_msg({vmq_msg, MsgRef, RoutingKey, Payload, Retain, Dup, QoS, Mountpoint, Persisted}, SGPolicy) ->
+publish({_, _} = SubscriberIdAndSubInfo, From, Msg) ->
+    vmq_reg:publish(SubscriberIdAndSubInfo, From, Msg);
+publish(_Node, _, Msg) ->
+    %% we ignore remote subscriptions, they are already covered
+    %% by original publisher
+    Msg.
+
+to_vmq_msgs(Msgs) ->
+    lists:map(
+      fun({deliver, QoS, Msg}) ->
+              {deliver, QoS, to_vmq_msg(Msg)}
+      end, Msgs).
+
+%% @private
+to_vmq_msg(#vmq_msg{} = Msg) ->
+    Msg;
+to_vmq_msg({vmq_msg, MsgRef, RoutingKey, Payload,
+            Retain, Dup, QoS, Mountpoint, Persisted,
+            SGPolicy}) ->
+    %% Pre-MQTT5 msg record. Fill in the missing ones.
     #vmq_msg{
        msg_ref = MsgRef,
        routing_key = RoutingKey,
@@ -221,11 +224,25 @@ compat_msg({vmq_msg, MsgRef, RoutingKey, Payload, Retain, Dup, QoS, Mountpoint, 
        qos = QoS,
        mountpoint = Mountpoint,
        persisted = Persisted,
-       sg_policy = SGPolicy}.
-
-publish({_, _} = SubscriberIdAndQoS, Msg) ->
-    vmq_reg:publish(SubscriberIdAndQoS, Msg);
-publish(_Node, Msg) ->
-    %% we ignore remote subscriptions, they are already covered
-    %% by original publisher
-    Msg.
+       sg_policy = SGPolicy,
+       properties = #{},
+       expiry_ts = undefined
+      };
+to_vmq_msg(InMsg) when is_tuple(InMsg),
+                       size(InMsg) > size(#vmq_msg{}) ->
+    %% we have a msg with unknown elements. As we don't know
+    %% how to handle those we strip them away and fill the
+    %% rest into the `vmq_msg` record we know.
+    #vmq_msg{
+       msg_ref = element(2, InMsg),
+       routing_key = element(3, InMsg),
+       payload = element(4, InMsg),
+       retain = element(5, InMsg),
+       dup = element(6, InMsg),
+       qos = element(7, InMsg),
+       mountpoint = element(8, InMsg),
+       persisted = element(9, InMsg),
+       sg_policy = element(10, InMsg),
+       properties = element(11, InMsg),
+       expiry_ts = element(12, InMsg)
+      }.

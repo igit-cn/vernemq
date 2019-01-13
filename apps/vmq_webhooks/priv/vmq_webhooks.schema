@@ -20,7 +20,16 @@
                                                                                  on_offline_message,
                                                                                  on_client_wakeup,
                                                                                  on_client_offline,
-                                                                                 on_client_gone]}},
+                                                                                 on_client_gone,
+                                                                                 auth_on_register_m5,
+                                                                                 auth_on_publish_m5,
+                                                                                 auth_on_subscribe_m5,
+                                                                                 on_register_m5,
+                                                                                 on_publish_m5,
+                                                                                 on_subscribe_m5,
+                                                                                 on_unsubscribe_m5,
+                                                                                 on_deliver_m5,
+                                                                                 on_auth_m5]}},
                                                                     {commented, "auth_on_register"},
                                                                     {include_default, "webhook1"}
                                                                    ]}.
@@ -83,3 +92,16 @@
  [{datatype, string},
   hidden,
   {default, "    webhooks    Manage webhooks\n"}]}.
+
+%% @doc Configure the maximum number of HTTP connections maintained in the webhooks pool.
+{mapping, "vmq_webhooks.pool_max_connections", "vmq_webhooks.pool_max_connections",
+ [{datatype, integer},
+  hidden,
+  {default, 100}]}.
+
+%% @doc Configure the timeout that we keep the connection alive in the 
+%% webhooks connection pool, expressed in milliseconds. 
+{mapping, "vmq_webhooks.pool_timeout", "vmq_webhooks.pool_timeout",
+ [{datatype, integer},
+  hidden,
+  {default, 60000}]}.

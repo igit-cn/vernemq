@@ -7,19 +7,18 @@
                   kernel,
                   stdlib,
                   lager,
+                  eleveldb,
                   cowboy,
                   ranch,
                   os_mon,
                   riak_sysmon,
                   ssl,
-                  plumtree,
                   vmq_commons,
                   vmq_ql,
                   vmq_plugin,
                   clique,
                   mzmetrics,
                   jsx,
-                  rand_compat,
                   gen_server2
                  ]},
   {mod, { vmq_server_app, []}},
@@ -50,6 +49,7 @@
       {queue_deliver_mode, fanout}, % balance vs fanout
       {queue_type, fifo}, % fifo vs lifo
       {persistent_client_expiration, 0}, % never
+      {max_last_will_delay, 0}, % not allowed
       {max_drain_time, 100}, 
       {max_msgs_per_drain_step, 10},
 
@@ -80,9 +80,17 @@
                                                    {nr_of_acceptors, 10}]}
                            ]}
       ]},
-      {http_modules, [vmq_metrics_http, vmq_http_mgmt_api]},
+      {http_modules, [
+          vmq_metrics_http, vmq_http_mgmt_api,
+          vmq_status_http, vmq_health_http]},
       {outgoing_clustering_buffer_size, 10000},
+      {remote_enqueue_timeout, 5000},
       {outgoing_connect_opts, []},
+      {outgoing_connect_params_module, vmq_cluster_node},
+      {outgoing_connect_timeout, 10000},
+      {shared_subscription_policy, prefer_local},
+      {shared_subscription_timeout_action, ignore},
+
       {tcp_listen_options, [
             {nodelay, true},
             {linger, {true, 0}}, 

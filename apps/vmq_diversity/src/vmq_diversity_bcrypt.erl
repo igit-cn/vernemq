@@ -13,23 +13,23 @@
 %% limitations under the License.
 
 -module(vmq_diversity_bcrypt).
+-include_lib("luerl/include/luerl.hrl").
 
 -export([install/1]).
-
 
 install(St) ->
     luerl_emul:alloc_table(table(), St).
 
 table() ->
     [
-     {<<"gen_salt">>, {function, fun gen_salt/2}},
-     {<<"hashpw">>, {function, fun hashpw/2}}
+        {<<"gen_salt">>, #erl_func{code = fun gen_salt/2}},
+        {<<"hashpw">>, #erl_func{code = fun hashpw/2}}
     ].
 
 gen_salt(_, St) ->
     {ok, Salt} = bcrypt:gen_salt(),
     {[list_to_binary(Salt)], St}.
 
-hashpw([Pass, Salt], St) when is_binary(Pass) and is_binary(Pass) ->
-    {ok, Hash} = bcrypt:hashpw(Pass, Salt),
+hashpw([Pass, Salt], St) when is_binary(Pass) and is_binary(Salt) ->
+    {ok, Hash} = bcrypt:hashpw(Pass, binary:bin_to_list(Salt)),
     {[list_to_binary(Hash)], St}.

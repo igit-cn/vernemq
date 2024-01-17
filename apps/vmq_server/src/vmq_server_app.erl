@@ -26,7 +26,8 @@
 -spec start(_, _) -> {'error', _} | {'ok', pid()} | {'ok', pid(), _}.
 start(_StartType, _StartArgs) ->
     ok = vmq_metadata:start(),
-
+    ok = vmq_message_store:start(),
+    maybe_update_nodetool(),
     case vmq_server_sup:start_link() of
         {error, _} = E ->
             E;
@@ -44,16 +45,21 @@ start(_StartType, _StartArgs) ->
 
 start_user_plugins() ->
     Plugins = application:get_env(vmq_server, user_plugins, []),
-    [ start_user_plugin(P) || P <- Plugins ].
+    [start_user_plugin(P) || P <- Plugins].
 
-start_user_plugin({_Order, #{path := Path,
-                             name := PluginName}}) ->
-    Res = case Path of
-              undefined ->
-                  vmq_plugin_mgr:enable_plugin(PluginName);
-              _ ->
-                  vmq_plugin_mgr:enable_plugin(PluginName, [{path, Path}])
-          end,
+start_user_plugin(
+    {_Order, #{
+        path := Path,
+        name := PluginName
+    }}
+) ->
+    Res =
+        case Path of
+            undefined ->
+                vmq_plugin_mgr:enable_plugin(PluginName);
+            _ ->
+                vmq_plugin_mgr:enable_plugin(PluginName, [{path, Path}])
+        end,
     case Res of
         ok ->
             ok;
@@ -63,5 +69,36 @@ start_user_plugin({_Order, #{path := Path,
 
 -spec stop(_) -> 'ok'.
 stop(_State) ->
+    ok = vmq_ranch_config:stop_all_mqtt_listeners(true),
+    _ = vmq_message_store:stop(),
     _ = vmq_metadata:stop(),
     ok.
+
+maybe_update_nodetool() ->
+    case init:get_argument(proto_dist) of
+        {ok, [[ProtoDist]]} ->
+            Root = code:root_dir(),
+            Nodetool = filename:join([
+                Root, "erts-" ++ erlang:system_info(version), "bin", "nodetool"
+            ]),
+            case escript:extract(Nodetool, []) of
+                {ok, [Shebang, Comment, _, Source]} ->
+                    {ok, UpdatedScriptBin} =
+                        escript:create(binary, [
+                            Shebang, Comment, {emu_args, "+fnu -proto_dist " ++ ProtoDist}, Source
+                        ]),
+                    try file:write_file(Nodetool, UpdatedScriptBin) of
+                        ok -> ok
+                    catch
+                        E:R ->
+                            lager:info("Could not write nodetool due to ~p for reason ~p ~n", [
+                                E, R
+                            ]),
+                            {error, R}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        error ->
+            ignore
+    end.

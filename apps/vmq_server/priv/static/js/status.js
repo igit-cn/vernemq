@@ -18,7 +18,7 @@ $(function() {
         template: $("#node_list_template").html(),
         target: $("#node_list"),
         cluster_status: {
-            url: "/status.json",
+            url: "status.json",
             last_calculated: Date.now(),
             rates: {}
         }
@@ -109,6 +109,14 @@ $(function() {
         }
     }
 
+    function flatten_minus_one(val) {
+        if (val == -1) {
+            return 0;
+        } else {
+            return val;
+        }
+    }
+
     function cap_zero(val) {
         if (val < 0) {
             return 0;
@@ -117,29 +125,41 @@ $(function() {
         }
     }
 
+    function calc_routing_score(node_name, rate_interval, local_matched, remote_matched) {
+        var local_matched_rate = calc_rate(node_name, "local_matched", rate_interval, local_matched);
+        var remote_matched_rate = calc_rate(node_name, "remote_matched", rate_interval, remote_matched);
+        var all = local_matched_rate + remote_matched_rate;
+        if (all > 0) {
+            return "" + Math.floor(local_matched_rate * 100 / all) + " / " + Math.floor(remote_matched_rate * 100 / all);
+        }
+        return "0 / 0";
+    }
+
     function cluster_status() {
         $.ajax({
             url: config.cluster_status.url,
-            success: function( response) {
-                console.log(response);
+            success: function(response) {
+                var response_obj = response[0];
+                var nodes = Object.keys(response_obj)
                 var total = {active: true, clients_online: 0, clients_offline: 0, connect_rate: 0, msg_in_rate: 0,
                     msg_out_rate: 0, msg_drop_rate: 0, msg_queued: 0};
                 var now = Date.now();
                 var cluster_size = 0;
                 var cluster_issues = [];
-                nodes = $.map(response, function(node_data, index) {
-                    node_name = Object.keys(node_data)[0];
-                    var this_node = node_data[node_name];
+                nodes = $.map(nodes, function(node_name) {
+                    var this_node = response_obj[node_name];
                     var rate_interval = (now - config.cluster_status.last_calculated) / 1000;
                     var connect_rate = calc_rate(node_name, "connect", rate_interval, this_node.num_online)
                     var msg_in_rate = calc_rate(node_name, "msg_in", rate_interval, this_node.msg_in)
                     var msg_out_rate = calc_rate(node_name, "msg_out", rate_interval, this_node.msg_out)
                     var msg_drop_rate = calc_rate(node_name, "queue_drop", rate_interval, this_node.msg_drop)
                     var cluster_view = calc_cluster_view(node_name, this_node.mystatus, cluster_issues);
+                    var routing_score = calc_routing_score(node_name, rate_interval,
+                                                           this_node.matches_local, this_node.matches_remote);
                     var node = {
                         node: node_name,
                         clients_online: this_node.num_online,
-                        clients_offline: this_node.num_offline,
+                        clients_offline: flatten_minus_one(this_node.num_offline),
                         connect_rate: connect_rate,
                         msg_in_rate: msg_in_rate,
                         msg_out_rate: msg_out_rate,
@@ -149,7 +169,8 @@ $(function() {
                         retained: this_node.num_retained,
                         cluster_view: cluster_view,
                         listeners: listener_types(this_node.listeners),
-                        version: this_node.version
+                        version: this_node.version,
+                        routing_score: routing_score
                     };
                     listener_check(node_name, this_node.listeners, cluster_view, cluster_issues);
                     cluster_size = Math.max(cluster_size, cluster_view.num_nodes);

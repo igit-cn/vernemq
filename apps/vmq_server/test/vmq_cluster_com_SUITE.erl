@@ -9,24 +9,19 @@
 %% ===================================================================
 init_per_suite(Config) ->
     S = vmq_test_utils:get_suite_rand_seed(),
-    %lager:start(),
-    %% this might help, might not...
-    os:cmd(os:find_executable("epmd")++" -daemon"),
-    {ok, Hostname} = inet:gethostname(),
-    case net_kernel:start([list_to_atom("runner@"++Hostname), shortnames]) of
-        {ok, _} -> ok;
-        {error, {already_started, _}} -> ok
-    end,
-    lager:info("node name ~p", [node()]),
-    Node = vmq_cluster_test_utils:start_node(test1, Config, default_case),
+    Config0 = vmq_cluster_test_utils:init_distribution(Config),
+    ct:log("node name ~p", [node()]),
+    {ok, Peer, Node} = vmq_cluster_test_utils:start_node(test_com1, Config, default_case),
+    ct:pal("This is the default NODE : ~p~n", [Node]),
     {ok, _} = ct_cover:add_nodes([Node]),
     vmq_cluster_test_utils:wait_until_ready([Node]),
-    [{node, Node}, S|Config].
+    [{peer, Peer}, {node, Node}, S| Config0].
 
-end_per_suite(_Config) ->
-    application:stop(lager),
-    ct_slave:stop(test1),
-    _Config.
+end_per_suite(Config) ->
+    {_, Peer} = lists:keyfind(peer, 1, Config),
+    {_, Node} = lists:keyfind(node, 1, Config),
+    ok = vmq_cluster_test_utils:stop_peer(Peer, Node),
+    Config.
 
 init_per_testcase(_Case, Config) ->
     vmq_test_utils:seed_rand(Config),
@@ -52,7 +47,7 @@ connect_params(_RemoteNode) ->
 connect_success_test(Config) ->
     ClusterNodePid = cluster_node_pid(Config),
     {ok, ListenSocket} = gen_tcp:listen(12345, [binary, {reuseaddr, true}, {active, false}]),
-    {ok, Socket} = gen_tcp:accept(ListenSocket, 20000),
+    {ok, Socket} = gen_tcp:accept(ListenSocket, 30000),
     recv_connect(Socket, Config),
 
     % send test message
@@ -64,23 +59,24 @@ connect_success_send_error(Config) ->
     % check that message isn't lost
     ClusterNodePid = cluster_node_pid(Config),
     {ok, ListenSocket} = gen_tcp:listen(12345, [binary, {reuseaddr, true}, {active, false}]),
-    {ok, Socket1} = gen_tcp:accept(ListenSocket, 20000),
+    {ok, Socket1} = gen_tcp:accept(ListenSocket, 30000),
     recv_connect(Socket1, Config),
     % close this socket
     gen_tcp:close(Socket1),
     % send test message, will be buffered and delivered on next successful reconnect
     ok = send_message(ClusterNodePid, hello_world),
 
-    {ok, Socket2} = gen_tcp:accept(ListenSocket, 20000),
+    {ok, Socket2} = gen_tcp:accept(ListenSocket, 30000),
     recv_connect(Socket2, Config),
     % recv this message
     recv_message(Socket2, hello_world).
 
 connect_success_send_error_timeout(Config) ->
+    ct:timetrap({minutes, 10}),
     % check that message isn't lost
     ClusterNodePid = cluster_node_pid(Config),
     {ok, ListenSocket} = gen_tcp:listen(12345, [binary, {reuseaddr, true}, {active, false}]),
-    {ok, Socket1} = gen_tcp:accept(ListenSocket, 20000),
+    {ok, Socket1} = gen_tcp:accept(ListenSocket, 30000),
     recv_connect(Socket1, Config),
 
     N = send_until_tcp_buffer_full(ClusterNodePid),
@@ -90,7 +86,7 @@ connect_success_send_error_timeout(Config) ->
     {error, closed} = gen_tcp:recv(Socket1, 0),
 
     % the cluster node should do the reconnect
-    {ok, Socket2} = gen_tcp:accept(ListenSocket, 20000),
+    {ok, Socket2} = gen_tcp:accept(ListenSocket, 30000),
     recv_connect(Socket2, Config),
 
     % the last buffered message is repeated as the cluster node doesn't
@@ -125,18 +121,18 @@ setup_mock_vmq_cluster_node(Config) ->
 
 setup_mock_vmq_cluster_node(Config, Opts) ->
     Node = proplists:get_value(node, Config),
-    % make the test1 node connect to myself
-    ok = rpc:call(Node, vmq_config, set_env, [outgoing_connect_opts, Opts, false]),
-    ok = rpc:call(Node, vmq_config, set_env, [outgoing_connect_params_module, ?MODULE, false]),
-    ok = rpc:call(Node, vmq_config, set_env, [outgoing_connect_timeout, 1000, false]),
-    ok = rpc:call(Node, vmq_config, set_env, [outgoing_clustering_buffer_size, 1000, false]),
-    {ok, ClusterNodePid} = rpc:call(Node, vmq_cluster_node, start_link, [node()]),
+    % make the test_com1 node connect to myself
+    ok = rpc:block_call(Node, vmq_config, set_env, [outgoing_connect_opts, Opts, false]),
+    ok = rpc:block_call(Node, vmq_config, set_env, [outgoing_connect_params_module, ?MODULE, false]),
+    ok = rpc:block_call(Node, vmq_config, set_env, [outgoing_connect_timeout, 1000, false]),
+    ok = rpc:block_call(Node, vmq_config, set_env, [outgoing_clustering_buffer_size, 1000, false]),
+    {ok, ClusterNodePid} = rpc:block_call(Node, vmq_cluster_node, start_link, [node()]),
     ClusterNodePid.
 
 terminate_mock_vmq_cluster_node(Config) ->
     Node = proplists:get_value(node, Config),
     ClusterNodePid = cluster_node_pid(Config),
-    rpc:call(Node, erlang, exit, [ClusterNodePid, kill]).
+    rpc:block_call(Node, erlang, exit, [ClusterNodePid, kill]).
 
 cluster_node_pid(Config) ->
     proplists:get_value(cluster_node_pid, Config).

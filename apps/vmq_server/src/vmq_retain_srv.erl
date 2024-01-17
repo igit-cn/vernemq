@@ -18,19 +18,23 @@
 -behaviour(gen_server2).
 
 %% API functions
--export([start_link/0,
-         insert/3,
-         delete/2,
-         match_fold/4,
-         stats/0]).
+-export([
+    start_link/0,
+    insert/3,
+    delete/2,
+    match_fold/4,
+    stats/0
+]).
 
 %% gen_server callbacks
--export([init/1,
-         handle_call/3,
-         handle_cast/2,
-         handle_info/2,
-         terminate/2,
-         code_change/3]).
+-export([
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2,
+    code_change/3
+]).
 
 -record(state, {}).
 
@@ -54,11 +58,18 @@ start_link() ->
         true ->
             ignore;
         false ->
-            ets:new(?RETAIN_CACHE, [public, named_table,
-                                    {read_concurrency, true},
-                                    {write_concurrency, true}]),
-            ets:new(?RETAIN_UPDATE, [public, named_table,
-                                     {write_concurrency, true}])
+            ets:new(?RETAIN_CACHE, [
+                public,
+                ordered_set,
+                named_table,
+                {read_concurrency, true},
+                {write_concurrency, true}
+            ]),
+            ets:new(?RETAIN_UPDATE, [
+                public,
+                named_table,
+                {write_concurrency, true}
+            ])
     end,
     gen_server2:start_link({local, ?MODULE}, ?MODULE, [], []).
 
@@ -75,40 +86,56 @@ insert(MP, RoutingKey, Message) ->
 match_fold(FoldFun, Acc, MP, Topic) ->
     case has_wildcard(Topic) of
         true ->
-            FFoldFun = fun({{M, T}, Payload}, AccAcc) when M == MP ->
-                               case vmq_topic:match(T, Topic) of
-                                   true ->
-                                       FoldFun({T, Payload}, AccAcc);
-                                   false ->
-                                       AccAcc
-                               end;
-                          (_, AccAcc) ->
-                               AccAcc
-                       end,
-            %% full table scan.
-            %% TODO: optimize
-            ets:foldl(FFoldFun, Acc, ?RETAIN_CACHE);
+            %% the performance is worse the earlier a wildcard occurs
+            %% in the subscription topic. Worst case is a # pr + as
+            %% the first topic element which will cause the entire
+            %% table to be scanned.
+            MatchTopic = topic2ms(Topic),
+            MS = [{{{MP, MatchTopic}, '_'}, [], ['$_']}],
+            lists:foldl(
+                fun
+                    ({{_M, T}, Payload}, AccAcc) ->
+                        case vmq_topic:match(T, Topic) of
+                            true ->
+                                FoldFun({{MP, T}, Payload}, AccAcc);
+                            false ->
+                                AccAcc
+                        end;
+                    (_, AccAcc) ->
+                        AccAcc
+                end,
+                Acc,
+                ets:select(?RETAIN_CACHE, MS)
+            );
         false ->
             case ets:lookup(?RETAIN_CACHE, {MP, Topic}) of
-                 [] -> Acc;
-                 [{_, Payload}] ->
-                    FoldFun({Topic, Payload}, Acc)
+                [] -> Acc;
+                [{_, Payload}] -> FoldFun({{MP, Topic}, Payload}, Acc)
             end
     end.
 
+-dialyzer({no_improper_lists, topic2ms/1}).
+topic2ms([]) -> [];
+topic2ms([<<"#">>]) -> '_';
+topic2ms([E, <<"#">>]) -> [e2ms(E) | '_'];
+topic2ms([E | Rest]) -> [e2ms(E) | topic2ms(Rest)].
+
+e2ms(<<"+">>) -> '_';
+e2ms(E) -> E.
+
 stats() ->
     case ets:info(?RETAIN_CACHE, size) of
-        undefined -> {0, 0};
+        undefined ->
+            {0, 0};
         V ->
             MC = ets:info(?RETAIN_CACHE, memory),
             case ets:info(?RETAIN_UPDATE, memory) of
                 undefined ->
-                    {V, MC*erlang:system_info(wordsize)};
+                    {V, MC * erlang:system_info(wordsize)};
                 MU ->
-                    {V, (MC+MU)*erlang:system_info(wordsize)}
+                    {V, (MC + MU) * erlang:system_info(wordsize)}
             end
     end.
-
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -127,14 +154,21 @@ stats() ->
 %%--------------------------------------------------------------------
 init([]) ->
     vmq_metadata:subscribe(?RETAIN_DB),
-    vmq_metadata:fold(?RETAIN_DB,
-      fun({MPTopic, '$deleted'}, _) ->
-              ets:delete(?RETAIN_CACHE, MPTopic);
-         ({MPTopic, Msg}, _) ->
-              ets:insert(?RETAIN_CACHE, [{MPTopic, Msg}])
-      end, ok),
-    erlang:send_after(vmq_config:get_env(retain_persist_interval, 1000),
-                      self(), persist),
+    vmq_metadata:fold(
+        ?RETAIN_DB,
+        fun
+            ({MPTopic, '$deleted'}, _) ->
+                ets:delete(?RETAIN_CACHE, MPTopic);
+            ({MPTopic, Msg}, _) ->
+                ets:insert(?RETAIN_CACHE, [{MPTopic, Msg}])
+        end,
+        ok
+    ),
+    erlang:send_after(
+        vmq_config:get_env(retain_persist_interval, 1000),
+        self(),
+        persist
+    ),
     {ok, #state{}}.
 
 %%--------------------------------------------------------------------
@@ -186,8 +220,11 @@ handle_info({updated, ?RETAIN_DB, Key, _OldVal, NewVal}, State) ->
 handle_info(persist, State) ->
     ets:foldl(fun persist/2, ignore, ?RETAIN_UPDATE),
     ets:match_delete(?RETAIN_UPDATE, {'_', 0}),
-    erlang:send_after(vmq_config:get_env(retain_persist_interval, 1000),
-                      self(), persist),
+    erlang:send_after(
+        vmq_config:get_env(retain_persist_interval, 1000),
+        self(),
+        persist
+    ),
     {noreply, State};
 handle_info(_, State) ->
     {noreply, State}.
@@ -236,7 +273,7 @@ persist({Key, Counter}, _) ->
     %% have persisted Counter updates, but not more than that.
     ets:update_counter(?RETAIN_UPDATE, Key, -Counter).
 
-has_wildcard([<<"+">>|_]) -> true;
+has_wildcard([<<"+">> | _]) -> true;
 has_wildcard([<<"#">>]) -> true;
-has_wildcard([_|Rest]) -> has_wildcard(Rest);
+has_wildcard([_ | Rest]) -> has_wildcard(Rest);
 has_wildcard([]) -> false.

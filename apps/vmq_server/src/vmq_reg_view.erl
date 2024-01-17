@@ -17,11 +17,11 @@
 
 -export([fold/5]).
 
--callback fold(SubscriberId :: subscriber_id(),
-               Topic :: topic(),
-               FoldFun :: fun((node() | {subscriber_id(), qos(), client_id() | any()} , any()) -> any()),
-               Accumulator :: any()
-
+-callback fold(
+    SubscriberId :: subscriber_id(),
+    Topic :: topic(),
+    FoldFun :: reg_view_fold_fun(),
+    Accumulator :: any()
 ) -> any().
 fold(RegView, SubscriberId, Topic, FoldFun, Acc) ->
     RegView:fold(SubscriberId, Topic, FoldFun, Acc).

@@ -56,15 +56,18 @@ groups() ->
          retain_qos1_qos0_test,
          retain_wildcard_test,
          publish_empty_retained_msg_test,
-         retain_compat_pre_test],
+         retain_compat_pre_test,
+         retain_qos0_clear_by_command_test],
+    GroupOpts = [shuffle, parallel],
     [
-     {mqttv4, [shuffle, parallel], Tests},
-     {mqttv5, [shuffle, parallel],
+     {mqttv4, GroupOpts, Tests},
+     {mqttv5, GroupOpts,
       [
        retain_with_properties,
        retain_with_message_expiry,
        subscribe_retain_as_published_test,
-       subscribe_retain_handling_flags_test
+       subscribe_retain_handling_flags_test,
+       subscribe_retain_subid_test
        |Tests]}
     ].
 
@@ -145,11 +148,39 @@ retain_qos0_clear_test(Cfg) ->
     ok = gen_tcp:send(Socket, Subscribe),
     ok = mqtt5_v4compat:expect_packet(Socket, "suback", Suback, Cfg),
     ok = mqtt5_v4compat:expect_packet(Socket, "publish", Publish, Cfg),
-    %% Now unsubscribe from the topic before we clear the retained mesage
+    %% Now unsubscribe from the topic before we clear the retained message
     ok = gen_tcp:send(Socket, Unsubscribe),
     ok = mqtt5_v4compat:expect_packet(Socket, "unsuback", Unsuback, Cfg),
     %% Now clear the retained message
     ok = gen_tcp:send(Socket, RetainClear),
+    %% Subscribe to topic, we shouldn't get anything back apart from the SUBACK
+    ok = gen_tcp:send(Socket, Subscribe),
+    ok = mqtt5_v4compat:expect_packet(Socket, "suback", Suback, Cfg),
+    {error, timeout} = gen_tcp:recv(Socket, 256, 1000),
+    ok = gen_tcp:close(Socket).
+
+retain_qos0_clear_by_command_test(Cfg) ->
+    Topic = vmq_cth:ustr(Cfg) ++ "retain/clear/test",
+    Connect = mqtt5_v4compat:gen_connect(vmq_cth:ustr(Cfg)
+                                 ++ "retain-clear-test", [{keepalive,60}], Cfg),
+    Connack = mqtt5_v4compat:gen_connack(success, Cfg),
+    Publish = mqtt5_v4compat:gen_publish(Topic, 0, <<"retained message">>, [{retain, true}], Cfg),
+    Subscribe = mqtt5_v4compat:gen_subscribe(592, Topic, 0, Cfg),
+    Suback = mqtt5_v4compat:gen_suback(592, 0, Cfg),
+    Unsubscribe = mqtt5_v4compat:gen_unsubscribe(593, Topic, Cfg),
+    Unsuback = mqtt5_v4compat:gen_unsuback(593, Cfg),
+    {ok, Socket} = mqtt5_v4compat:do_client_connect(Connect, Connack, [], Cfg),
+    %% Send retained message
+    ok = gen_tcp:send(Socket, Publish),
+    %% Subscribe to topic, we should get the retained message back.
+    ok = gen_tcp:send(Socket, Subscribe),
+    ok = mqtt5_v4compat:expect_packet(Socket, "suback", Suback, Cfg),
+    ok = mqtt5_v4compat:expect_packet(Socket, "publish", Publish, Cfg),
+    %% Now unsubscribe from the topic before we clear the retained message
+    ok = gen_tcp:send(Socket, Unsubscribe),
+    ok = mqtt5_v4compat:expect_packet(Socket, "unsuback", Unsuback, Cfg),
+    %% Now clear the retained message
+    ok = vmq_server_cli:command(["vmq-admin", "retain", "delete", "--topic=" ++ Topic], true),
     %% Subscribe to topic, we shouldn't get anything back apart from the SUBACK
     ok = gen_tcp:send(Socket, Subscribe),
     ok = mqtt5_v4compat:expect_packet(Socket, "suback", Suback, Cfg),
@@ -359,11 +390,11 @@ subscribe_retain_as_published_test(Cfg) ->
     {ok, #mqtt5_publish{
             retain = 1,
             payload = <<"msg1">>
-           }, <<>>} = packetv5:receive_frame(Socket),
+           }, Rest0} = packetv5:receive_frame(Socket),
     {ok, #mqtt5_publish{
             retain = 0,
             payload = <<"msg2">>
-           }, <<>>} = packetv5:receive_frame(Socket),
+           }, <<>>} = packetv5:receive_frame(gen_tcp, Socket, 5000, Rest0),
 
     %% Test subscription with RAP false
     PublishRetainedRapFalse = packetv5:gen_publish(TopicRapFalse, 0, <<"msg3">>, [{retain, true}]),
@@ -375,11 +406,11 @@ subscribe_retain_as_published_test(Cfg) ->
     {ok, #mqtt5_publish{
             retain = 0,
             payload = <<"msg3">>
-           }, <<>>} = packetv5:receive_frame(Socket),
+           }, Rest1} = packetv5:receive_frame(Socket),
     {ok, #mqtt5_publish{
             retain = 0,
             payload = <<"msg4">>
-           }, <<>>} = packetv5:receive_frame(Socket),
+           }, <<>>} = packetv5:receive_frame(gen_tcp, Socket, 5000, Rest1),
 
     Disconnect = packetv5:gen_disconnect(),
     ok = gen_tcp:send(Socket, Disconnect),
@@ -462,6 +493,39 @@ subscribe_retain_handling_flags_test(Cfg) ->
     ok = SubFun(Socket1, Topic, 3, send_if_new_sub),
     {error, timeout} = gen_tcp:recv(Socket1, 0, 100),
     ok = gen_tcp:send(Socket1, Disconnect).
+
+subscribe_retain_subid_test(Cfg) ->
+    %% test that retained messages delivered on subscription contain
+    %% the correct subscription identifiers.
+    Topic = vmq_cth:utopic(Cfg),
+    ClientId = vmq_cth:ustr(Cfg),
+
+    %% publish a retained msgs
+    Connect = packetv5:gen_connect(ClientId, [{clean_start, true}]),
+    Connack = packetv5:gen_connack(),
+    Disconnect = packetv5:gen_disconnect(),
+    PublishRetained = packetv5:gen_publish(Topic, 1, <<"a retained message">>, [{retain, true},
+                                                                                {mid, 7}]),
+    Puback = packetv5:gen_puback(7),
+    {ok, Socket0} = packetv5:do_client_connect(Connect, Connack, []),
+    ok = gen_tcp:send(Socket0, PublishRetained),
+    ok = packetv5:expect_frame(Socket0, Puback),
+
+    %% subscribe to retained msg topic
+    SubTopic = packetv5:gen_subtopic(Topic, 0,  false, false, send_retain),
+    Subscribe = packetv5:gen_subscribe(8, [SubTopic], #{p_subscription_id => [5]}),
+    SubAck = packetv5:gen_suback(8, [0], #{}),
+    ok = gen_tcp:send(Socket0, Subscribe),
+    ok = packetv5:expect_frame(Socket0, SubAck),
+
+    %% see that we get the retained messages with the correct subid.
+    PubRet = packetv5:gen_publish(Topic, 0, <<"a retained message">>, [{retain, true},
+                                                                       {properties,
+                                                                        #{p_subscription_id => [5]}}]),
+    ok = packetv5:expect_frame(Socket0, PubRet),
+
+    ok = gen_tcp:send(Socket0, Disconnect),
+    ok = gen_tcp:close(Socket0).
 
 retain_compat_pre_test(_Cfg) ->
     Pre = <<"msg">>,

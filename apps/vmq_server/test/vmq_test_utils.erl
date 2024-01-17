@@ -2,30 +2,36 @@
 -export([setup/0,
          teardown/0,
          reset_tables/0,
-         maybe_start_distribution/1,
          get_suite_rand_seed/0,
          seed_rand/1,
-         rand_bytes/1]).
+         rand_bytes/1,
+         get_free_port/0]).
 
 setup() ->
-    os:cmd(os:find_executable("epmd")++" -daemon"),
-    NodeName = list_to_atom("vmq_server-" ++ integer_to_list(erlang:phash2(os:timestamp()))),
-    ok = maybe_start_distribution(NodeName),
+    vmq_cluster_test_utils:init_distribution([]),
     Datadir = "/tmp/vernemq-test/data/" ++ atom_to_list(node()),
     os:cmd("rm -rf " ++ Datadir),
-    application:load(plumtree),
-    application:set_env(plumtree, plumtree_data_dir, Datadir),
-    application:set_env(plumtree, metadata_root, Datadir ++ "/meta/"),
+   % application:load(plumtree),
+   % application:set_env(plumtree, plumtree_data_dir, Datadir),
+   % application:set_env(plumtree, metadata_root, Datadir ++ "/meta/"),
+    application:load(vmq_swc),
+    application:set_env(vmq_swc, db_backend, leveldb),
+    application:set_env(vmq_swc, data_dir, Datadir),
+    application:set_env(vmq_swc, metadata_root, Datadir),
     application:load(vmq_server),
     PrivDir = code:priv_dir(vmq_server),
-    application:set_env(vmq_server, schema_dirs, [PrivDir]),
     application:set_env(vmq_server, listeners, [{vmq, [{{{0,0,0,0}, random_port()}, []}]}]),
     application:set_env(vmq_server, ignore_db_config, true),
-    application:set_env(vmq_server, msg_store_opts, [
-                                                     {store_dir, Datadir ++ "/msgstore"},
-                                                     {open_retries, 30},
-                                                     {open_retry_delay, 2000}
-                                                    ]),
+    application:load(vmq_plugin),
+    application:set_env(vmq_plugin, default_schema_dir, [PrivDir]),
+    application:set_env(vmq_server, metadata_impl, vmq_swc),
+    application:load(vmq_generic_msg_store),
+    % application:set_env(vmq_generic_msg_store, msg_store_opts, [
+    %                                                  {store_dir, Datadir ++ "/msgstore"},
+    %                                                  {open_retries, 30},
+    %                                                  {open_retry_delay, 2000}
+    %                                                 ]),
+    application:set_env(vmq_generic_msg_store, msg_store_engine, vmq_storage_engine_leveldb),
     LogDir = "log." ++ atom_to_list(node()),
     application:load(lager),
     application:set_env(lager, handlers, [
@@ -50,7 +56,9 @@ random_port() ->
 teardown() ->
     disable_all_plugins(),
     vmq_metrics:reset_counters(),
-    vmq_server:stop(),
+    vmq_server:stop(no_wait),
+    vmq_swc:stop(),
+    application:unload(vmq_swc),
     application:unload(vmq_server),
     Datadir = "/tmp/vernemq-test/data/" ++ atom_to_list(node()),
     _ = [eleveldb:destroy(Datadir ++ "/meta/" ++ integer_to_list(I), [])
@@ -63,27 +71,25 @@ teardown() ->
 disable_all_plugins() ->
     {ok, Plugins} = vmq_plugin_mgr:get_plugins(),
     %% Disable App Pluginns
-    lists:foreach(fun ({application, vmq_plumtree, _}) ->
+    lists:foreach(fun %({application, vmq_plumtree, _}) ->
                           % don't disable metadata plugin
+                       %   ignore;
+                       ({application, vmq_swc, _}) ->
+                                ignore;
+                        ({application, vmq_generic_msg_store, _}) ->
+                          % don't disable message store plugin
                           ignore;
-                      ({application, App, _Hooks}) ->
+                        ({application, App, _Hooks}) ->
                           vmq_plugin_mgr:disable_plugin(App);
-                      (_ModPlugins) ->
+                        (_ModPlugins) ->
                           ignore
                   end, Plugins),
     %% Disable Mod Plugins
-    _ = [vmq_plugin_mgr:disable_plugin(P) || P <- vmq_plugin:info(all)],
-    ok.
-
-maybe_start_distribution(Name) ->
-    case ets:info(sys_dist) of
-        undefined ->
-            %% started without -sname or -name arg
-            {ok, _} = net_kernel:start([Name, shortnames]),
-            ok;
-        _ ->
-            ok
-    end.
+    lists:foreach(fun ({_, vmq_lvldb_store, _, _}) ->
+                          ignore;
+                      (P) ->
+                          vmq_plugin_mgr:disable_plugin(P)
+                  end, vmq_plugin:info(all)).
 
 reset_tables() ->
     _ = [reset_tab(T) || T <- [subscriber, config, retain]],
@@ -131,3 +137,9 @@ seed_rand(Config) ->
 rand_bytes(N) ->
     L = [ rand:uniform(256)-1 || _ <- lists:seq(1,N)],
     list_to_binary(L).
+
+get_free_port() ->
+    {ok, Socket} = gen_tcp:listen(0, [binary, {active, once}]),
+    {ok, Port} = inet:port(Socket),
+    ok = gen_tcp:close(Socket),
+    Port.

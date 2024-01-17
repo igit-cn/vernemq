@@ -26,32 +26,41 @@
 -export([start_link/1, apply/4]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3]).
+-export([
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2,
+    code_change/3
+]).
 
 -define(SERVER, ?MODULE).
 
 -record(state, {
-          %% Name used for logging purposes.
-          name = undefined,
+    %% Name used for logging purposes.
+    name = undefined,
 
-          %% fun of arity 0 to start the worker.
-          start_fun = undefined,
+    %% fun of arity 0 to start the worker.
+    start_fun = undefined,
 
-          %% fun of arity 1 used to terminate the worker when shutting
-          %% down.
-          terminate_fun = undefined,
+    %% fun of arity 1 used to terminate the worker when shutting
+    %% down.
+    terminate_fun = undefined,
 
-          %% The worker PID if running.
-          worker = undefined :: undefined | {reference(), pid()},
+    %% The worker PID if running.
+    worker = undefined :: undefined | {reference(), pid()},
 
-          %% Is the client process ready?
-          connected = false :: boolean(),
-          
-          %% Reconnect timeout if the connection is lost (the worker
-          %% process dies).
-          reconnect_timeout
-         }).
+    %% Is the client process ready?
+    connected = false :: boolean(),
+
+    %% Reconnect timeout if the connection is lost (the worker
+    %% process dies).
+    reconnect_timeout :: non_neg_integer(),
+
+    %% Reconnect timer reference.
+    reconnect_tref :: undefined | reference()
+}).
 
 %%%===================================================================
 %%% API
@@ -61,14 +70,14 @@
 %% @doc
 %% Starts the server
 %%
-%% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
 %% @end
 %%--------------------------------------------------------------------
+-spec start_link(Opts :: list()) -> {ok, Pid :: pid()} | {error, Error :: term()}.
 start_link(Opts) ->
     gen_server:start_link(?MODULE, Opts, []).
 
 apply(Pid, Mod, Fun, Args) ->
-    gen_server:call(Pid, {apply, Mod, Fun, Args}).
+    gen_server:call(Pid, {apply, Mod, Fun, Args}, infinity).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -93,13 +102,15 @@ init(Opts) ->
     true = is_function(StartFun, 0),
     TerminateFun = proplists:get_value(terminate_fun, Opts),
     true = TerminateFun =:= undefined orelse is_function(TerminateFun, 1),
-    ReconnectTimetout = proplists:get_value(reconnect_timeout, Opts, 1000),
-    {ok, #state{name = Name,
-                start_fun = StartFun,
-                terminate_fun = TerminateFun,
-                reconnect_timeout = ReconnectTimetout,
-                connected=false,
-                worker=undefined}}.
+    ReconnectTimeout = proplists:get_value(reconnect_timeout, Opts, 1000),
+    {ok, #state{
+        name = Name,
+        start_fun = StartFun,
+        terminate_fun = TerminateFun,
+        reconnect_timeout = ReconnectTimeout,
+        connected = false,
+        worker = undefined
+    }}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -115,14 +126,16 @@ init(Opts) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_call({apply, _,_,_}, _From, #state{connected=false}=State) ->
+handle_call({apply, _, _, _}, _From, #state{connected = false} = State) ->
     {reply, {error, not_connected}, State};
-handle_call({apply, Mod, Fun, Args}, _From, #state{worker={_MRef, Pid}}=State) when is_pid(Pid) ->
+handle_call({apply, Mod, Fun, Args}, _From, #state{worker = {_MRef, Pid}} = State) when
+    is_pid(Pid)
+->
     Reply =
         try
-            erlang:apply(Mod, Fun, [Pid|Args])
+            erlang:apply(Mod, Fun, [Pid | Args])
         catch
-            exit:{noproc,_Reason} ->
+            exit:{noproc, _Reason} ->
                 %% We remove the worker pid only in handle_info where
                 %% the attempt to restart the process will also be
                 %% kicked off.
@@ -153,36 +166,38 @@ handle_cast(_Msg, State) ->
 %%                                   {stop, Reason, State}
 %% @end
 %%--------------------------------------------------------------------
-handle_info(connect, #state{start_fun=StartFun,name=Name,worker=undefined,connected=false} = State) ->
+handle_info(
+    connect,
+    #state{start_fun = StartFun, name = Name, worker = undefined, connected = false} = State
+) ->
     NewState =
-    case StartFun() of
-        {ok, Pid} ->
-            MRef = monitor(process, Pid),
-            State#state{worker={MRef, Pid},connected=true};
-        {error, Reason} ->
-            lager:warning("Could not connect to ~p due to ~p",
-                          [Name, Reason]),
-            schedule_reconnect(State),
-            State
-    end,
+        case StartFun() of
+            {ok, Pid} ->
+                MRef = monitor(process, Pid),
+                State#state{worker = {MRef, Pid}, connected = true, reconnect_tref = undefined};
+            {error, Reason} ->
+                lager:warning(
+                    "Could not connect to ~p due to ~p",
+                    [Name, Reason]
+                ),
+                schedule_reconnect(State#state{reconnect_tref = undefined})
+        end,
     {noreply, NewState};
-handle_info({'DOWN', MRef, process, WorkerPid, _}, #state{worker={MRef, WorkerPid}}=S) ->
-    schedule_reconnect(S),
-    {noreply, S#state{worker=undefined, connected=false}};
-handle_info({'EXIT',WorkerPid,_}, #state{worker={_MRef, WorkerPid}}=S) ->
+handle_info({'DOWN', MRef, process, WorkerPid, _}, #state{worker = {MRef, WorkerPid}} = S) ->
+    NewState = schedule_reconnect(S#state{worker = undefined, connected = false}),
+    {noreply, NewState};
+handle_info({'EXIT', WorkerPid, _}, #state{worker = {_MRef, WorkerPid}} = S) ->
     %% We got an exit - let's wait for the monitor signal to arrive
     %% before cleaning up and scheduling a reconnect, but mark the
     %% connection as down.
-    {noreply, S#state{connected=false}};
-handle_info({'EXIT',_,_}, #state{worker=undefined,connected=false}=S) ->
+    {noreply, S#state{connected = false}};
+handle_info({'EXIT', _, _}, #state{worker = undefined, connected = false} = S) ->
     %% Got an exit when starting the client process. schedule a
     %% reconnect.
-    schedule_reconnect(S),
-    {noreply, S};
+    NewState = schedule_reconnect(S),
+    {noreply, NewState};
 handle_info(_, S) ->
     {noreply, S}.
-
-
 
 %%--------------------------------------------------------------------
 %% @private
@@ -195,13 +210,13 @@ handle_info(_, S) ->
 %% @spec terminate(Reason, State) -> void()
 %% @end
 %%--------------------------------------------------------------------
-terminate(_Reason, #state{terminate_fun=TFun, worker={_Mref, Pid}})
-  when TFun =/= undefined ->
+terminate(_Reason, #state{terminate_fun = TFun, worker = {_Mref, Pid}}) when
+    TFun =/= undefined
+->
     TFun(Pid),
     ok;
 terminate(_Reason, _State) ->
     ok.
-
 
 %%--------------------------------------------------------------------
 %% @private
@@ -217,5 +232,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-schedule_reconnect(#state{reconnect_timeout=Timeout}) ->
-    erlang:send_after(Timeout, self(), connect).
+schedule_reconnect(#state{reconnect_tref = undefined, reconnect_timeout = Timeout} = S) ->
+    TRef = erlang:send_after(Timeout, self(), connect),
+    S#state{reconnect_tref = TRef};
+schedule_reconnect(S) ->
+    %% reconnect timer already scheduled.
+    S.

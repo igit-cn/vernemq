@@ -13,31 +13,34 @@
 %% limitations under the License.
 
 -module(vmq_diversity_json).
+-include_lib("luerl/include/luerl.hrl").
 
 -export([install/1]).
 
+-define(JSON_EMPTY_OBJECT, [{}]).
+-define(LUA_EMPTY_TABLE, []).
 
 install(St) ->
     luerl_emul:alloc_table(table(), St).
 
 table() ->
     [
-     {<<"decode">>, {function, fun decode/2}},
-     {<<"encode">>, {function, fun encode/2}}
+        {<<"decode">>, #erl_func{code = fun decode/2}},
+        {<<"encode">>, #erl_func{code = fun encode/2}}
     ].
 
-decode([Bin|_], St) when is_binary(Bin) ->
-    try jsx:decode(Bin) of
+decode([Bin | _], St) when is_binary(Bin) ->
+    try vmq_json:decode(Bin) of
         Result0 ->
-            {Result1, NewSt} = luerl:encode(Result0, St),
+            {Result1, NewSt} = luerl:encode(json_to_lua(Result0), St),
             {[Result1], NewSt}
     catch
         _:_ ->
             {[nil], St}
     end.
 
-encode([T|_], St) when is_tuple(T) ->
-    try jsx:encode(encode_value(luerl:decode(T, St))) of
+encode([T | _], St) when is_tuple(T) ->
+    try vmq_json:encode(lua_to_json(luerl:decode(T, St))) of
         Result0 ->
             {[Result0], St}
     catch
@@ -45,13 +48,31 @@ encode([T|_], St) when is_tuple(T) ->
             {[nil], St}
     end.
 
-encode_value(V) when is_list(V) ->
-    encode_list(V, []);
-encode_value(V) ->
+lua_to_json(?LUA_EMPTY_TABLE) ->
+    ?JSON_EMPTY_OBJECT;
+lua_to_json(V) when is_list(V) ->
+    lua_to_json_list(V, []);
+lua_to_json(V) ->
     V.
 
-encode_list([{K, V}|Rest], Acc) when is_integer(K) ->
-    encode_list(Rest, [encode_value(V)|Acc]);
-encode_list([{K, V}|Rest], Acc) when is_binary(K) ->
-    encode_list(Rest, [{K, encode_value(V)}|Acc]);
-encode_list([], Acc) -> lists:reverse(Acc).
+lua_to_json_list([{K, V} | Rest], Acc) when is_integer(K) ->
+    lua_to_json_list(Rest, [lua_to_json(V) | Acc]);
+lua_to_json_list([{K, V} | Rest], Acc) when is_binary(K) ->
+    lua_to_json_list(Rest, [{K, lua_to_json(V)} | Acc]);
+lua_to_json_list([], Acc) ->
+    lists:reverse(Acc).
+
+json_to_lua(?JSON_EMPTY_OBJECT) ->
+    ?LUA_EMPTY_TABLE;
+json_to_lua(Result) when is_list(Result) ->
+    lists:map(
+        fun
+            ({K, V}) ->
+                {K, json_to_lua(V)};
+            (V) ->
+                json_to_lua(V)
+        end,
+        Result
+    );
+json_to_lua(Result) ->
+    Result.

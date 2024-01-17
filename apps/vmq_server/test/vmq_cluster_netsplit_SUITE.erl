@@ -15,26 +15,16 @@
          remote_enqueue_cant_block_the_publisher/1
         ]).
 
--include_lib("common_test/include/ct.hrl").
--include_lib("kernel/include/inet.hrl").
 -include_lib("eunit/include/eunit.hrl").
--include_lib("vmq_commons/include/vmq_types.hrl").
 
 %% ===================================================================
 %% common_test callbacks
 %% ===================================================================
 init_per_suite(Config) ->
     S = vmq_test_utils:get_suite_rand_seed(),
-    lager:start(),
-    %% this might help, might not...
-    os:cmd(os:find_executable("epmd")++" -daemon"),
-    {ok, Hostname} = inet:gethostname(),
-    case net_kernel:start([list_to_atom("runner@"++Hostname), shortnames]) of
-        {ok, _} -> ok;
-        {error, {already_started, _}} -> ok
-    end,
+    Config0 = vmq_cluster_test_utils:init_distribution(Config),
     lager:info("node name ~p", [node()]),
-    [S | Config].
+    [S | Config0].
 
 end_per_suite(_Config) ->
     application:stop(lager),
@@ -42,26 +32,35 @@ end_per_suite(_Config) ->
 
 init_per_testcase(Case, Config) ->
     vmq_test_utils:seed_rand(Config),
-    Nodes = vmq_cluster_test_utils:pmap(
-              fun({N, P}) ->
-                      Node = vmq_cluster_test_utils:start_node(N, Config, Case),
-                      {ok, _} = rpc:call(Node, vmq_server_cmd, listener_start,
-                                         [P, []]),
-                      %% allow all
-                      ok = rpc:call(Node, vmq_auth, register_hooks, []),
-                      {Node, P}
-              end, [{test1, 18883},
-                    {test2, 18884},
-                    {test3, 18885},
-                    {test4, 18886},
-                    {test5, 18887}]),
-    {CoverNodes, _} = lists:unzip(Nodes),
-    {ok, _} = ct_cover:add_nodes(CoverNodes),
-    [{nodes, Nodes}|Config].
+    set_config(metadata_plugin, vmq_swc),
 
-end_per_testcase(_, _Config) ->
-    vmq_cluster_test_utils:pmap(fun(Node) -> ct_slave:stop(Node) end,
-                                [test1, test2, test3, test4, test5]),
+    NodeWithPorts =
+        [vmq_cluster_test_utils:random_node_with_port(Case) || _I <- lists:seq(1, 3)],
+    Nodes =
+        vmq_cluster_test_utils:pmap(fun({N, Port}) ->
+                                       {ok, Peer, Node} =
+                                           vmq_cluster_test_utils:start_node(N, Config, Case),
+                                       {ok, _} =
+                                           rpc:call(Node,
+                                                    vmq_server_cmd,
+                                                    listener_start,
+                                                    [Port, []]),
+                                       %% allow all
+                                       ok = rpc:call(Node, vmq_auth, register_hooks, []),
+                                       {Peer, Node, Port}
+                                    end,
+                                    NodeWithPorts),
+    {_, CoverNodes, _} = lists:unzip3(Nodes),
+    {ok, _} = ct_cover:add_nodes(CoverNodes),
+    [{nodes, Nodes} | Config].
+
+end_per_testcase(_, Config) ->
+    {_, NodeList} = lists:keyfind(nodes, 1, Config),
+    {Peers, Nodes, _} = lists:unzip3(NodeList),
+    vmq_cluster_test_utils:pmap(fun({Peer, Node}) ->
+                                   ok = vmq_cluster_test_utils:stop_peer(Peer, Node)
+                                end,
+                                lists:zip(Peers, Nodes)),
     ok.
 
 all() ->
@@ -81,12 +80,13 @@ set_config(Key, Val) ->
 
 register_consistency_test(Config) ->
     ok = ensure_cluster(Config),
+    set_config(allow_register_during_netsplit, false),
     {_, Nodes} = lists:keyfind(nodes, 1, Config),
     {Island1, Island2} = lists:split(length(Nodes) div 2, Nodes),
 
     %% Create Partitions
-    {Island1Names, _} = lists:unzip(Island1),
-    {Island2Names, _} = lists:unzip(Island2),
+    {_, Island1Names, _} = lists:unzip3(Island1),
+    {_, Island2Names, _} = lists:unzip3(Island2),
     vmq_cluster_test_utils:partition_cluster(Island1Names, Island2Names),
 
     ok = wait_until_converged(Nodes,
@@ -95,9 +95,9 @@ register_consistency_test(Config) ->
                                   rpc:call(N, vmq_cluster, is_ready, [])}
                          end, {{1, 0}, false}),
 
-    {_, Island1Port} = random_node(Island1),
-    {_, Island2Port} = random_node(Island2),
-
+    {_, _, Island1Port} = random_node(Island1),
+    {_, _, Island2Port} = random_node(Island2),
+    ct:sleep(10000),
     Connect = packet:gen_connect("test-client", [{clean_session, true},
                                                  {keepalive, 10}]),
     %% Island 1 should return us the proper CONNACK(3)
@@ -124,12 +124,12 @@ register_consistency_multiple_sessions_test(Config) ->
     set_config(allow_register_during_netsplit, true),
 
     %% Create Partitions
-    {Island1Names, _} = lists:unzip(Island1),
-    {Island2Names, _} = lists:unzip(Island2),
+    {_, Island1Names, _} = lists:unzip3(Island1),
+    {_, Island2Names, _} = lists:unzip3(Island2),
     vmq_cluster_test_utils:partition_cluster(Island1Names, Island2Names),
 
-    {_, Island1Port} = random_node(Island1),
-    {_, Island2Port} = random_node(Island2),
+    {_, _, Island1Port} = random_node(Island1),
+    {_, _, Island2Port} = random_node(Island2),
 
     Connect = packet:gen_connect("test-client-multiple", [{clean_session, true},
                                                  {keepalive, 10}]),
@@ -146,6 +146,7 @@ register_consistency_multiple_sessions_test(Config) ->
 
 register_not_ready_test(Config) ->
     ok = ensure_cluster(Config),
+    set_config(allow_register_during_netsplit, false),
     {_, Nodes} = lists:keyfind(nodes, 1, Config),
     {Island1, Island2} = lists:split(length(Nodes) div 2, Nodes),
 
@@ -153,13 +154,13 @@ register_not_ready_test(Config) ->
     Connect = packet:gen_connect("test-client-not-ready", [{clean_session, true},
                                                  {keepalive, 10}]),
     Connack = packet:gen_connack(0),
-    {_, Port} = random_node(Nodes),
+    {_, _, Port} = random_node(Nodes),
     {ok, _Socket} = packet:do_client_connect(Connect, Connack,
                                              [{port, Port}]),
 
     %% Create Partitions
-    {Island1Names, _} = lists:unzip(Island1),
-    {Island2Names, _} = lists:unzip(Island2),
+    {_, Island1Names, _} = lists:unzip3(Island1),
+    {_, Island2Names, _} = lists:unzip3(Island2),
     vmq_cluster_test_utils:partition_cluster(Island1Names, Island2Names),
 
     ok = wait_until_converged(Nodes,
@@ -172,7 +173,7 @@ register_not_ready_test(Config) ->
     [begin
          {ok, S} = packet:do_client_connect(Connect, ConnNack, [{port, P}]),
          gen_tcp:close(S)
-     end || {_, P} <- Nodes],
+     end || {_, _, P} <- Nodes],
 
     %% fix cables
     vmq_cluster_test_utils:heal_cluster(Island1Names, Island2Names),
@@ -186,7 +187,7 @@ register_not_ready_test(Config) ->
     [begin
          {ok, S} = packet:do_client_connect(Connect, Connack, [{port, P}]),
          gen_tcp:close(S)
-     end || {_, P} <- Nodes],
+     end || {_, _, P} <- Nodes],
     ok.
 
 publish_qos0_test(Config) ->
@@ -198,7 +199,7 @@ publish_qos0_test(Config) ->
     Connack = packet:gen_connack(0),
     Subscribe = packet:gen_subscribe(53, "netsplit/0/test", 0),
     Suback = packet:gen_suback(53, 0),
-    {_, Island1Port} = random_node(Island1),
+    {_, _, Island1Port} = random_node(Island1),
     {ok, Socket} = packet:do_client_connect(Connect, Connack, [{port,
                                                                 Island1Port}]),
     ok = gen_tcp:send(Socket, Subscribe),
@@ -209,8 +210,8 @@ publish_qos0_test(Config) ->
                          end, [{total, 1}]),
 
     %% Create Partitions
-    {Island1Names, _} = lists:unzip(Island1),
-    {Island2Names, _} = lists:unzip(Island2),
+    {_, Island1Names, _} = lists:unzip3(Island1),
+    {_, Island2Names, _} = lists:unzip3(Island2),
     vmq_cluster_test_utils:partition_cluster(Island1Names, Island2Names),
 
     ok = wait_until_converged(Nodes,
@@ -218,7 +219,7 @@ publish_qos0_test(Config) ->
                                  rpc:call(N, vmq_cluster, is_ready, [])
                          end, false),
 
-    {_, Island2Port} = random_node(Island2),
+    {_, _, Island2Port} = random_node(Island2),
     set_config(allow_register_during_netsplit, true),
     set_config(allow_publish_during_netsplit, true),
     Publish = packet:gen_publish("netsplit/0/test", 0, <<"message">>,
@@ -245,9 +246,9 @@ remote_enqueue_cant_block_the_publisher(Config) ->
     %% (publishes to a shared subscriber are delivered using
     %% the enqueue_remote function in the vmq_cluster mod).
     ConnectSub = packet:gen_connect("netsplit-shared-sub", [{clean_session, true},
-                                                            {keepalive, 10}]),
+                                                            {keepalive, 120}]),
     Connack = packet:gen_connack(0),
-    {_, PortSub} = random_node(Island1),
+    {_, _, PortSub} = random_node(Island1),
     {ok, SubSocket} = packet:do_client_connect(ConnectSub, Connack,
                                              [{port, PortSub}]),
     Subscribe = packet:gen_subscribe(53, "$share/group1/topic", 1),
@@ -257,11 +258,10 @@ remote_enqueue_cant_block_the_publisher(Config) ->
 
     %% Connect publisher to one side of the cluster
     ConnectPub = packet:gen_connect("netsplit-publisher", [{clean_session, true},
-                                                           {keepalive, 10}]),
-    {_, PortPub} = random_node(Island2),
+                                                           {keepalive, 120}]),
+    {_, _, PortPub} = random_node(Island2),
     {ok, PubSocket} = packet:do_client_connect(ConnectPub, Connack,
                                                [{port, PortPub}]),
-
     %% Let the cluster metadata converge.
     ok = wait_until_converged(Nodes,
                               fun(N) ->
@@ -269,8 +269,8 @@ remote_enqueue_cant_block_the_publisher(Config) ->
                               end, [{total, 1}]),
 
     %% Start the actual partition of the nodes.
-    {Island1Names, _} = lists:unzip(Island1),
-    {Island2Names, _} = lists:unzip(Island2),
+    {_, Island1Names, _} = lists:unzip3(Island1),
+    {_, Island2Names, _} = lists:unzip3(Island2),
     vmq_cluster_test_utils:partition_cluster(Island1Names, Island2Names),
     ok = wait_until_converged(Nodes,
                               fun(N) ->
@@ -300,7 +300,7 @@ ensure_cluster(Config) ->
     vmq_cluster_test_utils:ensure_cluster(Config).
 
 wait_until_converged(Nodes, Fun, ExpectedReturn) ->
-    {NodeNames, _} = lists:unzip(Nodes),
+    {_, NodeNames, _} = lists:unzip3(Nodes),
     vmq_cluster_test_utils:wait_until(
       fun() ->
               lists:all(fun(X) -> X == true end,
@@ -308,7 +308,7 @@ wait_until_converged(Nodes, Fun, ExpectedReturn) ->
                           fun(Node) ->
                                   ExpectedReturn == Fun(Node)
                           end, NodeNames))
-      end, 60*2, 500).
+      end, 100*2, 500).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%% Internal

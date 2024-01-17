@@ -27,10 +27,6 @@ init_per_testcase(_TestCase, Config) ->
     vmq_server_cmd:set_config(allow_anonymous, true),
     vmq_server_cmd:set_config(retry_interval, 10),
     vmq_server_cmd:listener_start(1888, []),
-    ok = vmq_plugin_mgr:enable_module_plugin(vmq_lvldb_store, msg_store_write, 2),
-    ok = vmq_plugin_mgr:enable_module_plugin(vmq_lvldb_store, msg_store_delete, 2),
-    ok = vmq_plugin_mgr:enable_module_plugin(vmq_lvldb_store, msg_store_find, 1),
-    ok = vmq_plugin_mgr:enable_module_plugin(vmq_lvldb_store, msg_store_read, 2),
     Config.
 
 end_per_testcase(_TestCase, _Config) ->
@@ -141,7 +137,7 @@ filtering_works(_Config) ->
     [#{topic := <<"with/+/wildcard">>, qos := 2}] =
         execute(["vmq-admin", "session", "show", "--qos=2",
                  "--topic", "--qos"]),
-    
+
     Disconnect = packet:gen_disconnect(),
     ok = gen_tcp:send(SubSocket, Disconnect),
     ok = gen_tcp:close(SubSocket),

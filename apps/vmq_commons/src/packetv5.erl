@@ -1,38 +1,42 @@
 -module(packetv5).
 -include_lib("vmq_commons/include/vmq_types.hrl").
--export([do_client_connect/2,
-         do_client_connect/3,
-         expect_frame/2,
-         receive_frame/1,
-         receive_frame/3]).
+-export([
+    do_client_connect/2,
+    do_client_connect/3,
+    expect_frame/2,
+    receive_frame/1,
+    receive_frame/3,
+    receive_frame/4
+]).
 
--export([gen_connect/2,
-         gen_connack/0,
-         gen_connack/1,
-         gen_connack/2,
-         gen_connack/3,
-         gen_publish/4,
-         gen_puback/1,
-         gen_puback/3,
-         gen_pubrec/1,
-         gen_pubrec/3,
-         gen_pubrel/1,
-         gen_pubrel/3,
-         gen_pubcomp/1,
-         gen_pubcomp/3,
-         gen_subtopic/2,
-         gen_subtopic/5,
-         gen_subscribe/3,
-         gen_suback/3,
-         gen_unsubscribe/3,
-         gen_unsuback/3,
-         gen_pingreq/0,
-         gen_pingresp/0,
-         gen_disconnect/0,
-         gen_disconnect/2,
-         gen_auth/0,
-         gen_auth/2
-        ]).
+-export([
+    gen_connect/2,
+    gen_connack/0,
+    gen_connack/1,
+    gen_connack/2,
+    gen_connack/3,
+    gen_publish/4,
+    gen_puback/1,
+    gen_puback/3,
+    gen_pubrec/1,
+    gen_pubrec/3,
+    gen_pubrel/1,
+    gen_pubrel/3,
+    gen_pubcomp/1,
+    gen_pubcomp/3,
+    gen_subtopic/2,
+    gen_subtopic/5,
+    gen_subscribe/3,
+    gen_suback/3,
+    gen_unsubscribe/3,
+    gen_unsuback/3,
+    gen_pingreq/0,
+    gen_pingresp/0,
+    gen_disconnect/0,
+    gen_disconnect/2,
+    gen_auth/0,
+    gen_auth/2
+]).
 
 gen_connect(ClientId, Opts) ->
     vmq_parser_mqtt5:gen_connect(ClientId, Opts).
@@ -55,7 +59,6 @@ gen_puback(MId) ->
 gen_puback(MId, ReasonCode, Properties) when is_map(Properties) ->
     vmq_parser_mqtt5:gen_puback(MId, ReasonCode, Properties).
 
-
 gen_pubrec(MId) ->
     gen_pubrec(MId, ?M5_SUCCESS, #{}).
 gen_pubrec(MId, ReasonCode, Properties) when is_map(Properties) ->
@@ -75,11 +78,12 @@ gen_subtopic(Topic, QoS) ->
     gen_subtopic(Topic, QoS, false, false, send_retain).
 gen_subtopic(Topic, QoS, NL, Rap, RH) ->
     #mqtt5_subscribe_topic{
-       topic = Topic,
-       qos = QoS,
-       no_local = NL,
-       rap = Rap,
-       retain_handling = RH}.
+        topic = Topic,
+        qos = QoS,
+        no_local = NL,
+        rap = Rap,
+        retain_handling = RH
+    }.
 
 gen_subscribe(Mid, Topics, Properties) when is_map(Properties) ->
     vmq_parser_mqtt5:gen_subscribe(Mid, Topics, Properties).
@@ -116,8 +120,13 @@ do_client_connect(ConnectPacket, Connack, Opts) ->
     Port = proplists:get_value(port, Opts, 1888),
     Timeout = proplists:get_value(timeout, Opts, 60000),
     Transport = proplists:get_value(transport, Opts, gen_tcp),
-    ConnOpts = [binary, {reuseaddr, true},{active, false}, {packet, raw}|
-                proplists:get_value(conn_opts, Opts, [])],
+    ConnOpts = [
+        binary,
+        {reuseaddr, true},
+        {active, false},
+        {packet, raw}
+        | proplists:get_value(conn_opts, Opts, [])
+    ],
     case Transport:connect(Host, Port, ConnOpts, Timeout) of
         {ok, Socket} ->
             Transport:send(Socket, ConnectPacket),
@@ -135,7 +144,11 @@ do_client_connect(ConnectPacket, Opts) ->
     Port = proplists:get_value(port, Opts, 1888),
     Timeout = proplists:get_value(timeout, Opts, 60000),
     Transport = proplists:get_value(transport, Opts, gen_tcp),
-    case Transport:connect(Host, Port, [binary, {reuseaddr, true},{active, false}, {packet, raw}], Timeout) of
+    case
+        Transport:connect(
+            Host, Port, [binary, {reuseaddr, true}, {active, false}, {packet, raw}], Timeout
+        )
+    of
         {ok, Socket} ->
             Transport:send(Socket, ConnectPacket),
             case receive_frame(Socket) of
@@ -167,7 +180,8 @@ expect_frame(Transport, Socket, Want, Timeout) ->
                     io:format(user, "want ~p: got: ~p~n", [WantPacket, GotPacket]),
                     E
             end;
-        E -> E
+        E ->
+            E
     end.
 
 receive_frame(Socket) ->
@@ -175,23 +189,30 @@ receive_frame(Socket) ->
 receive_frame(Transport, Socket) ->
     receive_frame(Transport, Socket, 5000).
 receive_frame(Transport, Socket, Timeout) ->
-    receive_frame_(Transport, Socket, Timeout, <<>>).
+    receive_frame(Transport, Socket, Timeout, <<>>).
 
-receive_frame_(Transport, Socket, Timeout, Incomplete) ->
-    case Transport:recv(Socket, 0, Timeout) of
-        {ok, Data} ->
-            NewData = <<Incomplete/binary, Data/binary>>,
-            case vmq_parser_mqtt5:parse(NewData) of
-                more ->
-                    receive_frame_(Transport, Socket, Timeout, NewData);
-                {error, R} ->
-                    {error, R};
-                {Frame, Rest} ->
-                    {ok, Frame, Rest}
+receive_frame(Transport, Socket, Timeout, Incomplete) ->
+    case vmq_parser_mqtt5:parse(Incomplete) of
+        more ->
+            case Transport:recv(Socket, 0, Timeout) of
+                {ok, Data} ->
+                    NewData = <<Incomplete/binary, Data/binary>>,
+                    case vmq_parser_mqtt5:parse(NewData) of
+                        more ->
+                            receive_frame(Transport, Socket, Timeout, NewData);
+                        {error, R} ->
+                            {error, R};
+                        {Frame, Rest} ->
+                            {ok, Frame, Rest}
+                    end;
+                E ->
+                    E
             end;
-        E -> E
+        {error, R} ->
+            {error, R};
+        {Frame, Rest} ->
+            {ok, Frame, Rest}
     end.
 
 compare_packets(Same, Same) -> ok;
 compare_packets(Want, Got) -> {error, {frames_not_equal, {want, Want}, {got, Got}}}.
-

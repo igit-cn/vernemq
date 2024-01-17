@@ -17,17 +17,18 @@
 -behaviour(supervisor).
 
 %% API functions
--export([start_link/0,
-         start_script/1,
-         reload_script/1,
-         stop_script/1,
-         stats/0]).
+-export([
+    start_link/0,
+    start_script/1,
+    reload_script/1,
+    stop_script/1,
+    stats/0
+]).
 
 %% Supervisor callbacks
 -export([init/1]).
 
--define(CHILD(Id, Mod, Type, Args), {Id, {Mod, start_link, Args},
-                                     permanent, 5000, Type, [Mod]}).
+-define(CHILD(Id, Mod, Type, Args), {Id, {Mod, start_link, Args}, permanent, 5000, Type, [Mod]}).
 
 %%%===================================================================
 %%% API functions
@@ -44,34 +45,49 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 start_script(Script) ->
-    supervisor:start_child(?MODULE, ?CHILD({vmq_diversity_script_sup_sup, Script},
-                                           vmq_diversity_script_sup_sup, supervisor, [Script])).
+    supervisor:start_child(
+        ?MODULE,
+        ?CHILD(
+            {vmq_diversity_script, Script},
+            vmq_diversity_script,
+            worker,
+            [Script]
+        )
+    ).
 
 reload_script(Script) ->
-    case lists:keyfind({vmq_diversity_script_sup_sup, Script}, 1,
-                       supervisor:which_children(?MODULE)) of
-        {_, Pid, supervisor, _} when is_pid(Pid) ->
-            vmq_diversity_script_sup_sup:reload_script(Pid);
+    case
+        lists:keyfind(
+            {vmq_diversity_script, Script},
+            1,
+            supervisor:which_children(?MODULE)
+        )
+    of
+        {_, Pid, worker, _} when is_pid(Pid) ->
+            vmq_diversity_script:reload_script(Pid);
         _ ->
             {error, script_not_found}
     end.
 
 stop_script(Script) ->
-    case supervisor:terminate_child(?MODULE, {vmq_diversity_script_sup_sup, Script}) of
+    case supervisor:terminate_child(?MODULE, {vmq_diversity_script, Script}) of
         ok ->
-            supervisor:delete_child(?MODULE, {vmq_diversity_script_sup_sup, Script});
+            supervisor:delete_child(?MODULE, {vmq_diversity_script, Script});
         E ->
             E
     end.
 
 stats() ->
-    lists:foldl(fun
-                    ({{vmq_diversity_script_sup_sup, _}, Child, _, _}, Acc) when is_pid(Child) ->
-                        Acc ++ vmq_diversity_script_sup_sup:stats(Child);
-                    (_, Acc) ->
-                        Acc
-                end, [], supervisor:which_children(?MODULE)).
-
+    lists:foldl(
+        fun
+            ({{vmq_diversity_script, Script}, Child, worker, _}, Acc) when is_pid(Child) ->
+                [{Script, vmq_diversity_script:stats(Child)} | Acc];
+            (_, Acc) ->
+                Acc
+        end,
+        [],
+        supervisor:which_children(?MODULE)
+    ).
 
 %%%===================================================================
 %%% Supervisor callbacks

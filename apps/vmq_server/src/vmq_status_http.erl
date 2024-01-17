@@ -14,34 +14,54 @@
 
 -module(vmq_status_http).
 -behaviour(vmq_http_config).
+-include("vmq_metrics.hrl").
 
--export([routes/0]).
+-export([routes/0, is_authorized/2]).
 -export([node_status/0]).
--export([init/3,
-         handle/2,
-         terminate/3]).
+-export([
+    init/2,
+    allowed_methods/2,
+    content_types_provided/2,
+    reply/2,
+    terminate/3
+]).
 
 routes() ->
-    [{"/status.json", ?MODULE, []},
-     {"/status", cowboy_static, {priv_file, vmq_server, "static/index.html"}},
-     {"/status/[...]", cowboy_static, {priv_dir, vmq_server, "static"}}].
+    [
+        {"/status.json", ?MODULE, []},
+        {"/status", cowboy_static, {priv_file, vmq_server, "static/index.html"}},
+        {"/status/[...]", cowboy_static, {priv_dir, vmq_server, "static"}}
+    ].
 
-init(_Type, Req, _Opts) ->
-    {ok, Req, undefined}.
+init(Req, Opts) ->
+    {cowboy_rest, Req, Opts}.
 
-handle(Req, State) ->
-    {ContentType, Req2} = cowboy_req:header(<<"content-type">>, Req,
-                                            <<"application/json">>),
-    {ok, reply(Req2, ContentType), State}.
+allowed_methods(Req, State) ->
+    {[<<"GET">>], Req, State}.
+
+content_types_provided(Req, State) ->
+    {
+        [
+            {{<<"application">>, <<"json">>, '*'}, reply}
+        ],
+        Req,
+        State
+    }.
+
+is_authorized(Req, State) ->
+    AuthMode = vmq_http_config:auth_mode(Req, vmq_status_http),
+    case AuthMode of
+        "apikey" -> vmq_auth_apikey:is_authorized(Req, State, "status");
+        "noauth" -> {true, Req, State};
+        _ -> {error, invalid_authentication_scheme}
+    end.
 
 terminate(_Reason, _Req, _State) ->
     ok.
 
-reply(Req, <<"application/json">>) ->
+reply(Req, State) ->
     Output = cluster_status(),
-    {ok, Req2} = cowboy_req:reply(200, [{<<"content-type">>, <<"application/json">>}],
-                                  Output, Req),
-    Req2.
+    {Output, Req, State}.
 
 cluster_status() ->
     Nodes0 = nodes(),
@@ -49,63 +69,43 @@ cluster_status() ->
     Result1 = [{R, N} || {{ok, R}, N} <- lists:zip(Result0, Nodes0)],
     {Result2, Nodes1} = lists:unzip(Result1),
     {ok, MyStatus} = node_status(),
-    Data = [{atom_to_binary(Node, utf8), NodeResult} || {Node, NodeResult} <- lists:zip([node() | Nodes1], [MyStatus | Result2])],
-    jsx:encode([Data]).
-
+    Data = [
+        {atom_to_binary(Node, utf8), NodeResult}
+     || {Node, NodeResult} <- lists:zip([node() | Nodes1], [MyStatus | Result2])
+    ],
+    vmq_json:encode([Data]).
 
 node_status() ->
-    % Total Connections
-    counter_val('socket_open'),
-    SocketOpen = counter_val('socket_open'),
-    SocketClose = counter_val('socket_close'),
-    TotalConnections = SocketOpen - SocketClose,
-    % Total Online Queues
-    TotalQueues = vmq_queue_sup_sup:nr_of_queues(),
-    TotalOfflineQueues = TotalQueues - TotalConnections,
-    % Total Publishes In
-    TotalPublishIn = counter_val('mqtt_publish_received'),
-    TotalPublishOut = counter_val('mqtt_publish_sent'),
-    TotalQueueIn = counter_val('queue_in'),
-    TotalQueueOut = counter_val('queue_out'),
-    TotalQueueDrop = counter_val('queue_drop'),
-    TotalQueueUnhandled = counter_val('queue_unhandled'),
-    {NrOfSubs, _SMemory} = vmq_reg_trie:stats(),
-    {NrOfRetain, _RMemory} = vmq_retain_srv:stats(),
-    {ok, [
-     {<<"num_online">>, TotalConnections},
-     {<<"num_offline">>, TotalOfflineQueues},
-     {<<"msg_in">>, TotalPublishIn},
-     {<<"msg_out">>, TotalPublishOut},
-     {<<"queue_in">>, TotalQueueIn},
-     {<<"queue_out">>, TotalQueueOut},
-     {<<"queue_drop">>, TotalQueueDrop},
-     {<<"queue_unhandled">>, TotalQueueUnhandled},
-     {<<"num_subscriptions">>, NrOfSubs},
-     {<<"num_retained">>, NrOfRetain},
-     {<<"mystatus">>, [[{atom_to_binary(Node, utf8), Status} || {Node, Status} <- vmq_cluster:status()]]},
-     {<<"listeners">>, listeners()},
-     {<<"version">>, version()}]}.
-
-counter_val(C) ->
-    try vmq_metrics:counter_val(C) of
-        Value -> Value
-    catch
-        _:_ -> 0
-    end.
+    {ok, NodeStatus} = vmq_info:node_status(),
+    {ok,
+        NodeStatus ++
+            [
+                {<<"mystatus">>, [
+                    [{atom_to_binary(Node, utf8), Status} || {Node, Status} <- vmq_cluster:status()]
+                ]},
+                {<<"listeners">>, listeners()}
+            ]}.
 
 listeners() ->
     lists:foldl(
-      fun({Type, Ip, Port, Status, MP, MaxConns}, Acc) ->
-              [[{type, Type}, {status, Status}, {ip, list_to_binary(Ip)},
-                {port, list_to_integer(Port)}, {mountpoint, MP}, {max_conns, MaxConns}]
-               |Acc]
-      end, [], vmq_ranch_config:listeners()).
-
-version() ->
-    case release_handler:which_releases(current) of
-        [{"vernemq", Version, _, current}|_] ->
-            list_to_binary(Version);
-        [] ->
-            [{"vernemq", Version, _, permanent}|_] = release_handler:which_releases(permanent),
-            list_to_binary(Version)
-    end.
+        fun({Type, Ip, Port, Status, MP, MaxConns, _, _}, Acc) ->
+            Ip1 =
+                case Ip of
+                    {local, FS} -> list_to_binary(FS);
+                    Any -> list_to_binary(Any)
+                end,
+            [
+                [
+                    {type, Type},
+                    {status, Status},
+                    {ip, Ip1},
+                    {port, list_to_integer(Port)},
+                    {mountpoint, MP},
+                    {max_conns, MaxConns}
+                ]
+                | Acc
+            ]
+        end,
+        [],
+        vmq_ranch_config:listeners()
+    ).
